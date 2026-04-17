@@ -1,0 +1,13 @@
+# 本地/会话状态
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 环境
+.env
+.env.*
