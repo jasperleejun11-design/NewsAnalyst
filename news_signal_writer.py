@@ -2,7 +2,7 @@
 """
 Phase 0: Parse macro.md → write news_signal.csv for MT5 EA consumption.
 
-Output path: MQL5/Files/news_signal.csv
+Output path: MT5 Common/Files (FILE_COMMON flag reads from here)
 Format:      timestamp,direction,strength,mute_until,confidence
              timestamp  = ISO-8601 UTC when signal was written
              direction  = +1 (bullish) / -1 (bearish) / 0 (neutral)
@@ -16,7 +16,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 MACRO_FILE  = Path(__file__).parent / ".trader" / "macro.md"
-SIGNAL_FILE = Path("/home/admin/OpusWorkspace/MQL5/Files/news_signal.csv")
+SIGNAL_FILE = Path(
+    "/data/mt5/data/.wine/drive_c/users/abc/AppData/Roaming/"
+    "MetaQuotes/Terminal/Common/Files/news_signal.csv"
+)
 
 
 def _parse_direction_and_strength(text: str) -> tuple:
