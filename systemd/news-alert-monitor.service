@@ -1,0 +1,27 @@
+[Unit]
+Description=News Analyst RSS Alert Monitor — XAUUSD breaking news triggers
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin/OpusWorkspace/NewsAnalyst
+ExecStart=/usr/bin/python3.11 /home/admin/OpusWorkspace/NewsAnalyst/alert_monitor.py
+
+# Script handles SIGTERM cleanly (logs "收到信号 15，退出")
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+StartLimitIntervalSec=600
+
+# Stdout/stderr already go to logs/alert_monitor.log via the script's own logger;
+# capture systemd-side messages separately for diagnostics
+StandardOutput=append:/home/admin/OpusWorkspace/NewsAnalyst/logs/alert_monitor.systemd.out
+StandardError=append:/home/admin/OpusWorkspace/NewsAnalyst/logs/alert_monitor.systemd.err
+
+[Install]
+WantedBy=multi-user.target
