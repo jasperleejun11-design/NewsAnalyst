@@ -39,10 +39,10 @@ TRIGGER_FILE = LOG_DIR / ".urgent_trigger"  # alert_monitor 写入，daemon 拾�
 WEEKEND_SUMMARY_MARKER = LOG_DIR / ".weekend_summary_date"  # 防重发标记
 WEEKEND_SUMMARY_UTC_HOUR = 16  # 周日 16:00 UTC = 开盘前 6h
 
-# 研究员推演：每 4h 轮动（UTC 00/04/08/12/16/20 各 :10 起 90min 窗口）— 独立于常规扫描
+# 研究员推演：每日 00:10 UTC（= BJ 08:10）跑 1 次，90min 窗口内完成；邮件 cron 01:00 UTC（= BJ 09:00）发送
 # 每 slot 只跑一次；marker 存 "YYYY-MM-DD-HH" 避免重放。
 DAILY_FORECAST_MARKER = LOG_DIR / ".forecast_slot"
-FORECAST_UTC_HOURS = (0, 4, 8, 12, 16, 20)
+FORECAST_UTC_HOURS = (0,)
 FORECAST_UTC_MINUTE = 10
 FORECAST_WINDOW_MIN = 90
 
@@ -228,7 +228,7 @@ DAILY_FORECAST_PROMPT = (
     "   ① 机构目标价最新（Goldman/JPM/UBS/HSBC/Citi/BofA）\n"
     "   ② 技术面（Fib/50日EMA/200日MA）— 仅作为客观参考锚，不写具体进场价\n"
     "   ③ 跨资产（DXY/10Y/30Y/TIPS/VIX）\n"
-    "   ④ 物理需求（中国 SGE 溢价/印度节日/央行 WGC）\n"
+    "   ④ 物理需求（亚洲 SGE 溢价/印度节日/央行 WGC）\n"
     "   ⑤ 仓位层（COT managed money/GLD flows）\n"
     "4. 产出**两时间尺度**推演（砍掉 6 月+ 长期）：\n"
     "   · 短期 24-72h：最可操作视野\n"
@@ -237,21 +237,37 @@ DAILY_FORECAST_PROMPT = (
     "5. 产出 **≥1 个独创框架**（不借用第三方）+ **反事实**（看多/看空各一段）\n"
     f"6. 覆盖写 {FORECAST_PATH_STR}（≤ 150 行；超出删旧留新——研究员产物也要 Trader 能读完）\n"
     f"7. 若推演结论有实质变化，同步更新 {MACRO_PATH_STR} 的【一行结论】和【关键倒计时】\n"
-    f"8. 发推送（🔬前缀 · 老板手机版）：python {NTFY_SCRIPT} \"🔬[每日推演] 标题\" \"摘要\"\n"
+    f"8. 发推送（🔬前缀 · 老板手机版 · 结论先行 · 人话）：python {NTFY_SCRIPT} \"🔬[每日推演] 标题\" \"摘要\"\n"
     "\n"
-    "【推送格式硬模板】\n"
+    "【推送格式硬模板 · 结论先行】\n"
     "```\n"
-    "📍现价 $X,XXX (MT5实时)\n"
-    "🎯 核心论点: XXX（一句话）\n"
-    "📊 论据1-3: 具体数字+来源\n"
-    "⚡ 24-72h: 方向+触发\n"
-    "⚠ 哑区/风险\n"
+    "🎯 [方向: 多/空/中性 · 强度] 一句人话结论（10字内，不含术语）\n"
+    "📍$X,XXX (MT5实时)\n"
+    "▼/▲ 论据1: 具体事实（数字+人名/地名/机构）\n"
+    "▼/▲ 论据2: 具体事实\n"
+    "▼/▲ 论据3: 具体事实\n"
+    "⚡ 24-72h看点: XX时间发生XX → 利多/利空\n"
+    "⚠ 哑区: XX时间禁入场（一句话理由）\n"
     "```\n\n"
-    "【硬禁令 · 四条】\n"
+    "【人话替换表 · 推送禁用术语】\n"
+    "- 'real yield压缩 / ceiling掀开' → '实际利率下降 → 金价天花板被打开'\n"
+    "- 'COT contrarian / positioning unwind' → '期货投机大户多头爆满 = 危险见顶信号'\n"
+    "- 'regime 切换 / regime决定性压制' → '大环境还在压制金价'\n"
+    "- 'term premium 暴力回归' → '长期美债利率冲高'\n"
+    "- '事件反弹≠regime转向' → '反弹是新闻刺激，不是趋势反转'\n"
+    "- 'breakeven 锁笼 / 通胀锁笼' → '油价撑高通胀预期'\n"
+    "- '定价权转长端' → '美债长端飙升，无息金价被压'\n"
+    "- '概念跃迁 / 硬资产' → 直接省掉或换'长线多头根基'\n"
+    "- 'succession premium' → 'Warsh上任溢价'\n"
+    "\n"
+    "【推送前自检 · 硬性】发送前自问：\"不懂金融的朋友看手机能秒懂吗？\" 任何一条术语没翻译=重写。\n"
+    "\n"
+    "【硬禁令 · 五条】\n"
     "- ❌ 禁止捏造价位：所有 XAUUSD 现价用 daemon 前置钩子注入的 MT5 价；历史价带日期+来源；机构目标带机构名\n"
     "- ❌ 禁止写具体支撑/阻力/进场位（'$4,680支撑''$4,860阻力''$4,750-4,780中期买点'均违规）——那是 AI Trader 的技术分析领域\n"
     "- ❌ 禁止'无论据论点'：每条推送论点必须有数字+来源；没来源的判断不放进推送\n"
-    "- ❌ 禁止把投行术语搬 push：'regime 切换/term premium/定价权' 留在 forecast.md；push 只说人话\n"
+    "- ❌ 禁止把投行术语搬 push：所有术语必须按【人话替换表】翻译；macro.md/forecast.md 可保留术语\n"
+    "- ❌ 禁止'结论后置'：第一行必须是 🎯 方向结论，不能先铺背景/数据/论据；老板 30 秒一瞥首屏要看到方向\n"
 )
 
 
@@ -730,8 +746,12 @@ def _slot_label(slot_hour: int) -> str:
 def should_send_daily_forecast() -> bool:
     """当前 slot 是否该触发？slot 存在且 marker 里记录的不是当前 slot → 触发。
 
-    触发条件不依赖 is_market_open()——研究员推演 7×24 都做。
+    周末完全停（2026-04-26 改）——周日 16:00 UTC 已有"周末汇总"覆盖开盘前 brief。
+    工作日（含周日 22:00 UTC 之后开盘的部分）仍走原逻辑。
+    高级别突发（alert_monitor 触发）独立路径，不受此限。
     """
+    if not is_market_open():
+        return False
     slot = current_forecast_slot()
     if slot is None:
         return False
