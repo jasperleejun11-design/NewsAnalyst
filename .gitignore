@@ -11,3 +11,4 @@ venv/
 # 环境
 .env
 .env.*
+.ntfy_token
