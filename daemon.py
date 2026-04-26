@@ -841,8 +841,11 @@ def _run_cycle(prompt, log_suffix, session_id, is_first_flag, cycle_count,
     mtime_after = macro_mtime()
 
     if ok and mtime_after == mtime_before:
-        log("警告：macro.md 未更新（mtime 未变），视为失败")
-        ok = False
+        if is_breaking:
+            log("breaking 周期：分析师判定无需更新 macro.md（合理 no-op，不计失败）")
+        else:
+            log("警告：macro.md 未更新（mtime 未变），视为失败")
+            ok = False
 
     cycle_count += 1
     now_ts = time.time()
