@@ -137,6 +137,29 @@ def _try_p1_enrich(title: str, message: str) -> tuple[str, str]:
         return title, message
 
 
+def _spawn_p1plus_analyst(title: str, message: str) -> None:
+    """P1+: fire-and-forget V5 顶级 trader 点评 LLM. Non-blocking — original
+    push completes immediately, analyst pushes its own ntfy ~30s later. Only
+    fires for ⭐⭐⭐ (gated inside news_analyst). Fully silent on any failure."""
+    try:
+        analyst_script = Path("/home/admin/OpusWorkspace/AITraderV5/agents/news_analyst.py")
+        if not analyst_script.exists():
+            return
+        # detach: stdout/stderr to log, no wait
+        log_path = Path("/home/admin/OpusWorkspace/AITraderV5/data/news_analyst")
+        log_path.mkdir(parents=True, exist_ok=True)
+        runner_log = log_path / "runner.log"
+        with open(runner_log, "ab") as f:
+            import subprocess as sp
+            sp.Popen(
+                ["python3.11", str(analyst_script), title, message],
+                stdout=f, stderr=sp.STDOUT,
+                start_new_session=True,
+            )
+    except Exception:
+        pass
+
+
 def main() -> int:
     if len(sys.argv) < 3:
         print("Usage: python ntfy_push.py <title> <message>", file=sys.stderr)
@@ -144,13 +167,15 @@ def main() -> int:
 
     title, message = sys.argv[1], sys.argv[2]
 
-    # P1: enrich high-impact news with XAU price context
+    # P1: enrich high-impact news with XAU price context (synchronous, fast)
     title, message = _try_p1_enrich(title, message)
 
     ok, info = send_ntfy(title, message)
     if ok:
         log_push_tracker(title, message, "ntfy", info)
         print(info)
+        # P1+: fire-and-forget LLM 顶级 trader 点评 (gated to ⭐⭐⭐ inside analyst)
+        _spawn_p1plus_analyst(title, message)
         return 0
 
     print(f"ntfy failed: {info}", file=sys.stderr)
