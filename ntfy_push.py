@@ -160,6 +160,18 @@ def _spawn_p1plus_analyst(title: str, message: str) -> None:
         pass
 
 
+def _is_breaking_high_impact(title: str, message: str) -> bool:
+    """⭐⭐⭐+ AND looks like a breaking-news push (vs scheduled forecast / cycle)."""
+    n = 0
+    for m in re.finditer(r"⭐+", message):
+        n = max(n, len(m.group()))
+    if n < 3:
+        return False
+    head = title[:30]
+    breaking_markers = ("🚨", "[突发", "[BREAKING", "[SPIKE", "[INTRADAY")
+    return any(mk in head for mk in breaking_markers)
+
+
 def main() -> int:
     if len(sys.argv) < 3:
         print("Usage: python ntfy_push.py <title> <message>", file=sys.stderr)
@@ -169,6 +181,16 @@ def main() -> int:
 
     # P1: enrich high-impact news with XAU price context (synchronous, fast)
     title, message = _try_p1_enrich(title, message)
+
+    # 用户 2026-05-08 反馈"7:39 raw + 7:41 LLM rewrite 这种重复不要发":
+    # ⭐⭐⭐+ breaking 新闻, 抑制原始 push, 只走 V5 LLM analyst 重写 (~30-60s 后单条 push,
+    # 第一人称叙事 + 剧本带概率, 用户偏好). 计划/复盘/forecast 类 push (🔬/📓 前缀)
+    # 即使 ⭐⭐⭐+ 也保留原 push (analyst 不重写它们).
+    if _is_breaking_high_impact(title, message):
+        log_push_tracker(title, message, "ntfy_suppressed", "deferred to LLM analyst")
+        _spawn_p1plus_analyst(title, message)
+        print("ntfy_suppressed: ⭐⭐⭐+ breaking, deferred to V5 LLM analyst rewrite")
+        return 0
 
     ok, info = send_ntfy(title, message)
     if ok:
