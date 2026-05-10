@@ -42,9 +42,10 @@ WEEKEND_SUMMARY_UTC_HOUR = 16  # 周日 16:00 UTC = 开盘前 6h
 # 研究员推演：每日 00:10 UTC（= BJ 08:10）跑 1 次，90min 窗口内完成；邮件 cron 01:00 UTC（= BJ 09:00）发送
 # 每 slot 只跑一次；marker 存 "YYYY-MM-DD-HH" 避免重放。
 DAILY_FORECAST_MARKER = LOG_DIR / ".forecast_slot"
-FORECAST_UTC_HOURS = (0,)
+FORECAST_UTC_HOURS = (0, 18)   # 0=工作日早晨; 18=周日 prep (= 周一 02:00 SGT 美盘开盘前 6h)
 FORECAST_UTC_MINUTE = 10
 FORECAST_WINDOW_MIN = 90
+WEEKEND_FORECAST_HOUR = 18     # 仅周日 18:00 UTC slot 在 weekend 触发
 
 # 模型分级：按任务重要性选用不同成本的模型
 # 可用 CLAUDE_MODEL 环境变量整体覆盖（用于调试）
@@ -1057,15 +1058,25 @@ def _slot_label(slot_hour: int) -> str:
 def should_send_daily_forecast() -> bool:
     """当前 slot 是否该触发？slot 存在且 marker 里记录的不是当前 slot → 触发。
 
-    周末完全停（2026-04-26 改）——周日 16:00 UTC 已有"周末汇总"覆盖开盘前 brief。
-    工作日（含周日 22:00 UTC 之后开盘的部分）仍走原逻辑。
-    高级别突发（alert_monitor 触发）独立路径，不受此限。
+    工作日: 走 UTC 0 slot (开盘前 prep, 含周日 22:00 UTC 之后开盘的部分).
+    周末 (用户 2026-05-09 加): 仅周日 18:00 UTC 一次 prep forecast
+                              (= 周一 02:00 SGT, 美盘开盘前 6h).
+    高级别突发 (alert_monitor 触发) 独立路径, 不受此限.
     """
-    if not is_market_open():
-        return False
     slot = current_forecast_slot()
     if slot is None:
         return False
+    market_open = is_market_open()
+    now = datetime.now(timezone.utc)
+    wd = now.weekday()
+    if market_open:
+        # 工作日: 只走 UTC 0 slot (避免 18 slot 在工作日多跑一次)
+        if slot != 0:
+            return False
+    else:
+        # 周末: 仅周日 18:00 UTC slot 跑 (跨周末 prep)
+        if wd != 6 or slot != WEEKEND_FORECAST_HOUR:
+            return False
     label = _slot_label(slot)
     try:
         if DAILY_FORECAST_MARKER.exists():

@@ -160,16 +160,33 @@ def _spawn_p1plus_analyst(title: str, message: str) -> None:
         pass
 
 
-def _is_breaking_high_impact(title: str, message: str) -> bool:
-    """⭐⭐⭐+ AND looks like a breaking-news push (vs scheduled forecast / cycle)."""
+def _count_max_stars(message: str) -> int:
+    """body 里最多连续 ⭐ 的数量 (作为信号强度估计)."""
     n = 0
     for m in re.finditer(r"⭐+", message):
         n = max(n, len(m.group()))
-    if n < 3:
+    return n
+
+
+def _is_breaking_high_impact(title: str, message: str) -> bool:
+    """⭐⭐⭐+ AND looks like a breaking-news push (vs scheduled forecast / cycle)."""
+    if _count_max_stars(message) < 3:
         return False
     head = title[:30]
     breaking_markers = ("🚨", "[突发", "[BREAKING", "[SPIKE", "[INTRADAY")
     return any(mk in head for mk in breaking_markers)
+
+
+def _is_xau_weekend(now: datetime | None = None) -> bool:
+    """XAU 闭市判定 (Friday 21:00 UTC ~ Sunday 21:00 UTC).
+    跟 AITraderV5/agents/market_hours.py 同口径."""
+    now = now or datetime.now(timezone.utc)
+    wd = now.weekday()
+    h = now.hour + now.minute / 60.0
+    if wd == 4 and h >= 21: return True
+    if wd == 5: return True
+    if wd == 6 and h < 21: return True
+    return False
 
 
 def main() -> int:
@@ -181,6 +198,19 @@ def main() -> int:
 
     # P1: enrich high-impact news with XAU price context (synchronous, fast)
     title, message = _try_p1_enrich(title, message)
+
+    # 用户 2026-05-09 反馈: 周末 (XAU 闭市) news 升阈到 ⭐⭐⭐⭐+
+    # — 只 truly market-moving event 通过, 噪音 (⭐⭐⭐ 弱事件) 全部静默.
+    # 工作日不变. 计划/复盘/forecast (🔬/📓 前缀) 不在此 gate (它们是 prep info).
+    head = title[:30]
+    is_breaking_marker = any(mk in head for mk in ("🚨", "[突发", "[BREAKING", "[SPIKE", "[INTRADAY"))
+    if _is_xau_weekend() and is_breaking_marker:
+        max_stars = _count_max_stars(message)
+        if max_stars < 4:
+            log_push_tracker(title, message, "ntfy_skipped_weekend",
+                             f"max_stars={max_stars}<4 (weekend threshold)")
+            print(f"ntfy_skipped: 周末 + max_stars={max_stars}<⭐⭐⭐⭐, 静默")
+            return 0
 
     # 用户 2026-05-08 反馈"7:39 raw + 7:41 LLM rewrite 这种重复不要发":
     # ⭐⭐⭐+ breaking 新闻, 抑制原始 push, 只走 V5 LLM analyst 重写 (~30-60s 后单条 push,
