@@ -1,0 +1,24 @@
+[Unit]
+Description=News Analyst Price Monitor — XAUUSD 30s tick via win-tester
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin/OpusWorkspace/NewsAnalyst
+ExecStart=/usr/bin/python3.11 /home/admin/OpusWorkspace/NewsAnalyst/price_monitor.py
+
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+StartLimitIntervalSec=600
+
+StandardOutput=append:/home/admin/OpusWorkspace/NewsAnalyst/logs/price_monitor.systemd.out
+StandardError=append:/home/admin/OpusWorkspace/NewsAnalyst/logs/price_monitor.systemd.err
+
+[Install]
+WantedBy=multi-user.target

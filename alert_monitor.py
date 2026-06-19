@@ -26,6 +26,11 @@ SEEN_FILE = LOG_DIR / ".alert_seen"
 RECENT_TRIGGERS_FILE = LOG_DIR / ".alert_recent_triggers"
 PID_FILE = LOG_DIR / ".alert.pid"
 
+# Sidecar: AITraderV5 直接读取的地缘警报文件（绕过 daemon 延迟）
+GEO_ALERT_FILE = Path("/home/admin/OpusWorkspace/AITraderV5/data/cockpit/geo_alerts.json")
+GEO_ALERT_SCORE_MIN = 20   # 写入 sidecar 的最低分（低于此不写）
+GEO_ALERT_MAX_AGE_H = 4    # sidecar 保留最近 N 小时的条目
+
 POLL_INTERVAL = 120   # 每2分钟轮询一次
 TRIGGER_THRESHOLD = 10  # 评分达到此值才写触发文件
 MAX_SEEN = 1000        # 最多记住多少条已见标题
@@ -55,6 +60,10 @@ RSS_FEEDS = [
     ("Fed 新闻",            "https://www.federalreserve.gov/feeds/press_all.xml"),
     ("Fed 讲话",            "https://www.federalreserve.gov/feeds/speeches.xml"),
     ("ECB 新闻",            "https://www.ecb.europa.eu/rss/press.html"),
+    # 高频快讯（Fed 讲话/经济数据第一时间）
+    ("ForexLive",          "https://www.forexlive.com/feed/news"),
+    ("Reuters Business via Google", "https://news.google.com/rss/search?q=when:6h+source:reuters+(fed+OR+powell+OR+waller+OR+bowman+OR+cpi+OR+nfp)&hl=en-US"),
+    ("Bloomberg via Google",        "https://news.google.com/rss/search?q=when:6h+source:bloomberg+(fed+OR+powell+OR+waller+OR+bowman+OR+rate+cut)&hl=en-US"),
 ]
 
 # 关键词评分表。分值越高 = 越紧急。
@@ -80,6 +89,19 @@ KEYWORDS: dict[str, int] = {
     "ceasefire collapsed":   10,
     "ceasefire expires":     10,
     "fighting resumes":      10,
+    # 美伊协议签字专项 (2026-06-14 加，签字即触发)
+    "iran deal signed":      10,
+    "mou signed":            10,
+    "iran signed":           10,
+    "peace deal signed":     10,
+    "hormuz open":           10,
+    "hormuz opens":          10,
+    "vance iran":            10,
+    "islamabad declaration": 10,
+    "iran accord":           10,
+    "iran agreement signed": 10,
+    "hormuz reopens":        10,
+    "iran war ends":         10,
     "flash crash":           10,
     # 英文 · 货币/金融危机
     "emergency rate":        10,
@@ -113,6 +135,142 @@ KEYWORDS: dict[str, int] = {
     "熔断":                   10,
     "暴跌":                   10,
     "暴涨":                   10,
+    # ─── Tier-1 · 俄伊会谈专项 (4/27 active 监控) ──────────────────
+    "araghchi":              10,
+    "uranium custody":       10,
+    "uranium transfer":      10,
+    "russia iran alliance":  10,
+    "russia iran treaty":    10,
+    "iran russia treaty":    10,
+    "moscow tehran joint":   10,
+    "kremlin tehran joint":  10,
+    "safety guarantees":     10,
+    "strategic partnership upgrade": 10,
+    "阿拉格希":               10,
+    "俄伊联盟":               10,
+    "俄伊条约":               10,
+    "俄伊战略":               10,
+    "保管浓缩铀":             10,
+    "战略伙伴升级":           10,
+    "安全保护伞":             10,
+    # ─── Tier-1 · Powell 记者会专项 (4/29 active 监控，5/15 Warsh 接班前) ──
+    "transitory":            10,
+    "powell dovish":         10,
+    "powell hawkish":        10,
+    "powell pivot":          10,
+    "powell rate cut":       10,
+    "rate cut path":         10,
+    "rate cut signal":       10,
+    "easing bias removed":   10,
+    "easing bias retained":  10,
+    "qt-for-cuts":           10,
+    "warsh dovish":          10,
+    "warsh hawkish":         10,
+    "powell final":          10,
+    "fed pivot":             10,
+    "通胀临时性":             10,
+    "鲍威尔转向":             10,
+    "鲍威尔鸽派":             10,
+    "鲍威尔鹰派":             10,
+    "降息路径":               10,
+    "鹰派分歧":               10,
+    "鸽派分歧":               10,
+    # ─── Tier-1 · PCE/GDP 4/30 专项 (~17h后发布) ──────────────────
+    "core pce":              10,
+    "pce hot":               10,
+    "pce cool":              10,
+    "pce jumps":             10,
+    "pce surges":            10,
+    "pce drops":             10,
+    "pce eases":             10,
+    "pce above":             10,
+    "pce below":             10,
+    "pce beat":              10,
+    "pce miss":              10,
+    "pce surprise":          10,
+    "pce inflation":         10,
+    "core inflation":        10,
+    "fed preferred gauge":   10,
+    "gdp contracts":         10,
+    "gdp shrinks":           10,
+    "gdp beats":             10,
+    "gdp exceeds":           10,
+    "gdp surprise":          10,
+    "advance gdp":           10,
+    "stagflation surge":     10,
+    "核心pce":                10,
+    "pce数据":                10,
+    "pce通胀":                10,
+    "通胀降温":               10,
+    "通胀超预期":             10,
+    "通胀低于预期":           10,
+    "通胀加速":               10,
+    "经济萎缩":               10,
+    "gdp 萎缩":               10,
+    "滞胀确认":               10,
+    # ─── Tier-1 · Project Freedom 专项 (5/4 启动·active监控) ─────────
+    "project freedom":       10,
+    "maritime freedom":      10,
+    "tanker attack":         10,
+    "tanker mined":          10,
+    "tanker hit":            10,
+    "ship mined":            10,
+    "tanker boarded":        10,
+    "ship attacked hormuz":  10,
+    "iran attacks tanker":   10,
+    "iran attacks ship":     10,
+    "iran attacks escort":   10,
+    "iran attacks navy":     10,
+    "iran fires escort":     10,
+    "iran sinks":            10,
+    "navy strikes iran":     10,
+    "us strikes iran":       10,
+    "hormuz reopens":        10,
+    "hormuz reopened":       10,
+    "hormuz cleared":        10,
+    "naval coalition":       10,
+    "freedom of navigation": 10,
+    "护航行动":               10,
+    "美军护航":               10,
+    "护航船被攻击":           10,
+    "护航船触雷":             10,
+    "霍尔木兹重开":           10,
+    "海军联盟":               10,
+    "海峡冲突":               10,
+    "击沉护航":               10,
+    "击中护航":               10,
+    # ─── Tier-1 · 美债利率专项 (5/4 30Y破5%·active监控) ─────────────
+    "30-year yield 5":       10,
+    "30y yield 5":           10,
+    "30-year tops 5":        10,
+    "yield breaks 5":        10,
+    "yield tops 5.10":       10,
+    "yield tops 5.20":       10,
+    "yield tops 5.30":       10,
+    "30y above 5":           10,
+    "treasury rout":         10,
+    "bond rout":             10,
+    "bond massacre":         10,
+    "long bond crisis":      10,
+    "bond vigilantes":       10,
+    "treasury selloff":      10,
+    "auction failed":        10,
+    "auction tail":          10,
+    "weak treasury demand":  10,
+    "fed emergency qe":      10,
+    "operation twist":       10,
+    "yield curve control":   10,
+    "ycc":                   10,
+    "fed buys treasuries":   10,
+    "fed buying long bonds": 10,
+    "30年美债破5":            10,
+    "美债破5":                10,
+    "长债危机":               10,
+    "国债拍卖失败":           10,
+    "美债收益率飙升":         10,
+    "美联储紧急购债":         10,
+    "美联储扭转操作":         10,
+    "收益率曲线控制":         10,
 
     # ─── Tier-2 (6) · 重要，需要分析 ─────────────────────────────
     # 英文 · 地缘
@@ -195,6 +353,102 @@ KEYWORDS: dict[str, int] = {
     "美债":                   6,
     "衰退":                   6,
     "滞胀":                   6,
+    # ─── Tier-2 · 俄伊会谈专项辅助词 (与 putin/iran/普京/伊朗组合可累积过线) ──
+    "lavrov":                6,
+    "kremlin":               6,
+    "tehran moscow":         6,
+    "moscow tehran":         6,
+    "拉夫罗夫":               6,
+    "克里姆林":               6,
+    "德黑兰":                 6,
+    "圣彼得堡":               6,
+    # ─── Tier-2 · Powell 记者会辅助词 (与 powell/fed 组合可累积过线) ──
+    "policy pivot":          6,
+    "easing bias":           6,
+    "data dependent":        6,
+    "fed easing":            6,
+    "fed tightening":        6,
+    "miran":                 6,
+    "hammack":               6,
+    "logan":                 6,
+    "dissent":               6,
+    "dovish":                6,
+    "hawkish":               6,
+    "鸽派":                   6,
+    "鹰派":                   6,
+    "分歧":                   6,
+    "缩表":                   6,
+    # ─── Tier-1.5 · 月份 + 降息/加息 组合(FOMC dissent / repricing 早期信号) ──
+    "july rate cut":        10,
+    "july cut":             10,
+    "september rate cut":   10,
+    "september cut":        10,
+    "december rate cut":    10,
+    "december cut":         10,
+    "july hike":            10,
+    "september hike":       10,
+    "open to cut":           8,
+    "cut on the table":      8,
+    "on the table":          4,
+    "support rate cut":     10,
+    "backs rate cut":       10,
+    "calls for rate cut":   10,
+    "calls for cut":        10,
+    "7月降息":               10,
+    "9月降息":               10,
+    "12月降息":              10,
+    "支持降息":               8,
+    "呼吁降息":               8,
+    # ─── Tier-2 · PCE/GDP 辅助词 ──────────────────────────────────
+    "personal consumption":  6,
+    "consumption expenditures": 6,
+    "real gdp":              6,
+    "preliminary gdp":       6,
+    "month over month":      6,
+    "year over year":        6,
+    "y/y":                   6,
+    "m/m":                   6,
+    "annualized":            6,
+    "consensus":             6,
+    "环比":                   6,
+    "同比":                   6,
+    "预期":                   6,
+    "共识":                   6,
+    # ─── Tier-2 · Project Freedom 辅助词 ──────────────────────────
+    "escort":                6,
+    "convoy":                6,
+    "stranded ships":        6,
+    "shipping lane":         6,
+    "centcom":               6,
+    "destroyer":             6,
+    "frigate":               6,
+    "carrier strike":        6,
+    "护航":                   6,
+    "护送":                   6,
+    "中立船":                 6,
+    "中立商船":               6,
+    "海军":                   6,
+    "驱逐舰":                 6,
+    "航母":                   6,
+    # ─── Tier-2 · 美债利率辅助词 ────────────────────────────────
+    "long bond":             6,
+    "long-dated":            6,
+    "duration risk":         6,
+    "bond fund":             6,
+    "primary dealer":        6,
+    "treasury auction":      6,
+    "tlt":                   6,
+    "yield spike":           6,
+    "yield surge":           6,
+    "5.0%":                  6,
+    "5.1%":                  6,
+    "5.2%":                  6,
+    "5.3%":                  6,
+    "美债拍卖":               6,
+    "长期国债":               6,
+    "收益率":                 6,
+    "基点":                   6,
+    "扭转操作":               6,
 
     # ─── Tier-3 (3) · 一般关注 ───────────────────────────────────
     # 英文
@@ -400,6 +654,48 @@ def write_trigger(headline: str, source: str, score: int, matched_kws: list):
     logger.warning(f"🚨 突发触发！score={score} [{source}] {headline[:80]}")
 
 
+def append_geo_alert(headline: str, source: str, score: int, matched_kws: list):
+    """将高分事件追加到 AITraderV5 geo_alerts sidecar，绕过 daemon 延迟直达 Opus prompt。"""
+    if score < GEO_ALERT_SCORE_MIN:
+        return
+    try:
+        now = datetime.now(timezone.utc)
+        cutoff = now.timestamp() - GEO_ALERT_MAX_AGE_H * 3600
+        # 读取现有条目
+        existing = []
+        if GEO_ALERT_FILE.exists():
+            try:
+                data = json.loads(GEO_ALERT_FILE.read_text(encoding="utf-8"))
+                existing = data.get("alerts", [])
+            except Exception:
+                existing = []
+        # 剔除过期条目
+        existing = [
+            a for a in existing
+            if datetime.fromisoformat(a["time"]).timestamp() >= cutoff
+        ]
+        # 追加新条目（相同 headline 5min 内不重复）
+        recent_headlines = {
+            a["headline"] for a in existing
+            if now.timestamp() - datetime.fromisoformat(a["time"]).timestamp() < 300
+        }
+        if headline not in recent_headlines:
+            existing.append({
+                "time":     now.isoformat(),
+                "headline": headline,
+                "source":   source,
+                "score":    score,
+                "keywords": matched_kws,
+            })
+        payload = {"last_updated": now.isoformat(), "alerts": existing}
+        GEO_ALERT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = GEO_ALERT_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(str(tmp), str(GEO_ALERT_FILE))
+    except Exception as e:
+        logger.warning(f"[geo_alert] 写入失败: {e}")
+
+
 def poll_once(seen: set, recent_triggers: list) -> tuple:
     """轮询所有 RSS，返回 (new_seen, triggered, new_recent_triggers)。"""
     new_seen = set(seen)
@@ -424,6 +720,8 @@ def poll_once(seen: set, recent_triggers: list) -> tuple:
                         f"kws={matched} ~ {sorted(dup_kws)} | {item['title'][:60]}"
                     )
                     continue
+                # 无论是否触发，高分事件都写入 sidecar 供 Opus 实时读取
+                append_geo_alert(item["title"], item["source"], score, matched)
                 # 如果触发文件已存在（daemon 尚未处理上一个），不覆盖，只记录
                 if TRIGGER_FILE.exists():
                     logger.info(f"触发器待处理中，跳过: score={score} {item['title'][:60]}")
