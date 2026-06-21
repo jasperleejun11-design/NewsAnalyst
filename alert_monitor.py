@@ -568,6 +568,67 @@ def infer_direction(matched_kws: list) -> int | None:
     return None
 
 
+# Negation pre-filter — counterfactual / denial / "ruled out" headlines.
+# Pure keyword matching has 0% negation awareness; without this filter,
+# "Trump denies missile strike" would write fast-path +1 (wrong direction).
+# Proximity-based: negation marker within ±NEGATION_WINDOW_CHARS of any
+# direction-mapped keyword in the headline → skip fast-path, let LLM handle.
+# Conservative: false-positive skip costs 3min latency, false-negative
+# wrong direction costs 3min wrong-side hedge. We prefer skip.
+import re
+
+NEGATION_WINDOW_CHARS = 30
+
+_NEGATION_PATTERN_EN = re.compile(
+    r"\b(?:no|not|never|none|n't|"
+    r"deni(?:es|ed|al|es')|deny(?:ing)?|"
+    r"reject(?:s|ed|ing)?|refuse(?:s|d|ing)?|"
+    r"rule[ds]? out|ruling out|"
+    r"despite|without|"
+    r"fails? to|failed to|unable to|"
+    r"downplays?|downplayed|"
+    r"dismiss(?:es|ed|ing)?|"
+    r"false|fake|debunked|hoax|untrue|baseless|"
+    r"no longer|no more)\b",
+    re.IGNORECASE,
+)
+
+_NEGATION_PATTERN_CN = re.compile(
+    "否认|否决|拒绝|否定|排除|"
+    "并未|并无|并没|未会|不会|不再|不曾|"
+    "辟谣|澄清|不实|无意|未能|不成|"
+    "失败|失利|破裂|搁置|搁浅|流产"
+)
+
+
+def has_negation_near_keyword(text: str, keyword: str) -> bool:
+    """Return True if any negation marker is within ±NEGATION_WINDOW_CHARS
+    of the keyword's position in text. Case-insensitive for English; Chinese
+    uses multi-char markers only to avoid bare-"不" false positives."""
+    text_lower = text.lower()
+    kw_lower = keyword.lower()
+    pos = text_lower.find(kw_lower)
+    while pos >= 0:
+        ws = max(0, pos - NEGATION_WINDOW_CHARS)
+        we = min(len(text), pos + len(kw_lower) + NEGATION_WINDOW_CHARS)
+        window = text[ws:we]
+        if _NEGATION_PATTERN_EN.search(window) or _NEGATION_PATTERN_CN.search(window):
+            return True
+        pos = text_lower.find(kw_lower, pos + 1)
+    return False
+
+
+def has_directional_negation(text: str, matched_kws: list) -> bool:
+    """Check if any direction-mapped matched keyword has a negation marker
+    within its proximity window. Used to suppress fast-path on counterfactual
+    headlines (LLM will handle the nuance later)."""
+    return any(
+        has_negation_near_keyword(text, kw)
+        for kw in matched_kws
+        if kw in KEYWORD_DIRECTION_MAP
+    )
+
+
 def write_preliminary_news_signal(direction: int, headline: str, score: int,
                                    matched_kws: list) -> bool:
     """Fast-path write to news_signal.csv. Bypasses daemon LLM cycle.
@@ -849,7 +910,14 @@ def poll_once(seen: set, recent_triggers: list) -> tuple:
                 # 绕过 daemon LLM cycle (~3min)，让 EA <30s 感知。daemon 后续 refine。
                 fast_dir = infer_direction(matched)
                 if fast_dir is not None:
-                    write_preliminary_news_signal(fast_dir, item["title"], score, matched)
+                    text_for_negation = item["title"] + " " + item.get("desc", "")
+                    if has_directional_negation(text_for_negation, matched):
+                        logger.info(
+                            f"[fast-path] negation 跳过: dir={fast_dir:+d} "
+                            f"kws={matched} | {item['title'][:60]}"
+                        )
+                    else:
+                        write_preliminary_news_signal(fast_dir, item["title"], score, matched)
                 # 如果触发文件已存在（daemon 尚未处理上一个），不覆盖，只记录
                 if TRIGGER_FILE.exists():
                     logger.info(f"触发器待处理中，跳过: score={score} {item['title'][:60]}")
