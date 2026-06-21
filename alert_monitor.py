@@ -25,6 +25,7 @@ TRIGGER_FILE = LOG_DIR / ".urgent_trigger"
 SEEN_FILE = LOG_DIR / ".alert_seen"
 RECENT_TRIGGERS_FILE = LOG_DIR / ".alert_recent_triggers"
 PID_FILE = LOG_DIR / ".alert.pid"
+DAEMON_PID_FILE = LOG_DIR / ".daemon.pid"  # daemon.py PID,用于 SIGUSR1 主动唤醒
 
 # Sidecar: AITraderV5 直接读取的地缘警报文件（绕过 daemon 延迟）
 GEO_ALERT_FILE = Path("/home/admin/OpusWorkspace/AITraderV5/data/cockpit/geo_alerts.json")
@@ -618,6 +619,19 @@ def has_negation_near_keyword(text: str, keyword: str) -> bool:
     return False
 
 
+def wake_daemon() -> bool:
+    """SIGUSR1 → daemon.py,绕过 60s 轮询让它立即 pickup trigger / refine fast-path CSV。
+    Best-effort:daemon 不在或 PID stale 时静默 no-op,不影响 alert_monitor 主链。"""
+    try:
+        if not DAEMON_PID_FILE.exists():
+            return False
+        pid = int(DAEMON_PID_FILE.read_text().strip())
+        os.kill(pid, signal.SIGUSR1)
+        return True
+    except (ProcessLookupError, ValueError, OSError, PermissionError):
+        return False
+
+
 def has_directional_negation(text: str, matched_kws: list) -> bool:
     """Check if any direction-mapped matched keyword has a negation marker
     within its proximity window. Used to suppress fast-path on counterfactual
@@ -908,6 +922,7 @@ def poll_once(seen: set, recent_triggers: list) -> tuple:
                 append_geo_alert(item["title"], item["source"], score, matched)
                 # Fast-path geo gate: 若 keyword 方向无歧义，立即写 news_signal.csv 给 EA
                 # 绕过 daemon LLM cycle (~3min)，让 EA <30s 感知。daemon 后续 refine。
+                wrote_anything = False
                 fast_dir = infer_direction(matched)
                 if fast_dir is not None:
                     text_for_negation = item["title"] + " " + item.get("desc", "")
@@ -918,6 +933,7 @@ def poll_once(seen: set, recent_triggers: list) -> tuple:
                         )
                     else:
                         write_preliminary_news_signal(fast_dir, item["title"], score, matched)
+                        wrote_anything = True
                 # 如果触发文件已存在（daemon 尚未处理上一个），不覆盖，只记录
                 if TRIGGER_FILE.exists():
                     logger.info(f"触发器待处理中，跳过: score={score} {item['title'][:60]}")
@@ -925,6 +941,11 @@ def poll_once(seen: set, recent_triggers: list) -> tuple:
                     write_trigger(item["title"], item["source"], score, matched)
                     new_recent.append((time.time(), frozenset(matched)))
                     triggered = True
+                    wrote_anything = True
+                # 主动唤醒 daemon — fast-path 写了 CSV 或 trigger 文件都通知它
+                # (SIGUSR1 → daemon 跳出 sleep,LLM cycle 立即跑,refine CSV)
+                if wrote_anything and wake_daemon():
+                    logger.info(f"[wake-daemon] SIGUSR1 → daemon (refine ASAP)")
 
     # 剪枝过期记录
     cutoff = time.time() - STORY_COOLDOWN_MIN * 60

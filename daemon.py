@@ -35,8 +35,16 @@ CYCLE_TIMEOUT = 600            # 10 min max per cycle
 HEARTBEAT_INTERVAL = 24 * 3600 # 每 24h 发一条"我还活着"推送
 SESSION_REBUILD_INTERVAL = 24 * 3600  # 每 24h 主动重建会话（时间维度）
 SESSION_MAX_CYCLES = 4         # 每 4 次常规周期也重建（约 24h，防万一时间漂移）
-SLEEP_TICK = 60                # sleep 粒度（秒），用于中途检测触发文件
+SLEEP_TICK = 60                # 长 sleep 粒度（秒），主循环 idle 间隔语义
+WAKE_TICK_FINE = 5             # interruptible_sleep 内部细粒度（秒）— 检测 flag/触发文件
 TRIGGER_FILE = LOG_DIR / ".urgent_trigger"  # alert_monitor 写入，daemon 拾取
+
+# SIGUSR1 主动唤醒：alert_monitor 写完 trigger/fast-path CSV 后发信号，
+# 让 daemon 跳出 interruptible_sleep，不等 60s 轮询。
+# 注意 PEP 475:Python 3.5+ time.sleep 被信号打断会自动 resume，
+# 因此必须用短 tick (5s) 让 flag check 高频发生，wake 延迟 0-5s。
+# 2026-06-21 Phase 1.6 加入。
+_wake_now = False
 WEEKEND_SUMMARY_MARKER = LOG_DIR / ".weekend_summary_date"  # 防重发标记
 WEEKEND_SUMMARY_UTC_HOUR = 16  # 周日 16:00 UTC = 开盘前 6h
 
@@ -909,8 +917,14 @@ def acquire_pid():
         def _graceful_exit(signum, frame):
             log(f"收到信号 {signum}，退出")
             sys.exit(0)
+        def _wake_handler(signum, frame):
+            # 信号处理器保持极简：仅置 flag，由 interruptible_sleep 检测。
+            # 不在此处 log（async-signal-safe 限制）。
+            global _wake_now
+            _wake_now = True
         signal.signal(signal.SIGTERM, _graceful_exit)
         signal.signal(signal.SIGINT, _graceful_exit)
+        signal.signal(signal.SIGUSR1, _wake_handler)
     return True
 
 
@@ -1192,14 +1206,20 @@ def build_breaking_prompt(trigger: dict) -> str:
 
 
 def interruptible_sleep(seconds: float) -> None:
-    """分 SLEEP_TICK 粒度 sleep，期间检测触发文件。
-    发现触发即提前返回（不消费文件），由主循环 read_and_clear_trigger 统一处理。"""
+    """以 WAKE_TICK_FINE (5s) 细粒度 sleep，期间检测 SIGUSR1 wake flag + 触发文件。
+    发现触发即提前返回（不消费文件），由主循环 read_and_clear_trigger 统一处理。
+    PEP 475:time.sleep 不会因信号 early-return，因此用短 tick 让 wake 延迟 ≤5s。"""
+    global _wake_now
     deadline = time.time() + seconds
     while time.time() < deadline:
-        tick = min(SLEEP_TICK, deadline - time.time())
+        tick = min(WAKE_TICK_FINE, deadline - time.time())
         if tick <= 0:
             break
         time.sleep(tick)
+        if _wake_now:
+            _wake_now = False
+            log("⚡ SIGUSR1 唤醒,提前返回主循环")
+            return
         if TRIGGER_FILE.exists():
             log("⚡ sleep 期间检测到触发文件，提前返回主循环")
             return
