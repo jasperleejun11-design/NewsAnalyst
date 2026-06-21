@@ -2,11 +2,10 @@
 """
 News Analyst Daemon — 完全独立于 AI Trader。
 
-每小时一次 cycle：Claude Code CLI（`claude`）
-  claude -p "prompt" --resume <session-id> --permission-mode bypassPermissions
-  - 首次会话：生成 UUID，用 --session-id 创建；之后用 --resume 延续
+每小时一次 cycle：LLM CLI（默认 `codex`，兼容 `claude`）
+  - codex：ephemeral 单轮执行，依赖 macro/forecast 文件维持跨轮上下文
+  - claude：用 --session-id/--resume 延续会话
   - 一次性子进程，有超时，无死锁
-  - 会话上下文通过 --resume 跨 cycle 保持
   - daemon 自己控制调度
 """
 import json
@@ -24,7 +23,9 @@ from pathlib import Path
 NEWS_HOME = Path(__file__).resolve().parent
 LOG_DIR = NEWS_HOME / "logs"
 PID_FILE = LOG_DIR / ".daemon.pid"
-SESSION_FILE = LOG_DIR / ".claude_session_id"
+SESSION_FILE = LOG_DIR / ".agent_session_id"
+LEGACY_SESSION_FILE = LOG_DIR / ".claude_session_id"
+AGENT_BACKEND_FILE = LOG_DIR / ".agent_backend"
 MACRO_FILE = NEWS_HOME / ".trader" / "macro.md"
 NTFY_TOPIC = "jasperli-zhh-xauusd"
 NTFY_TOKEN_FILE = NEWS_HOME / ".ntfy_token"
@@ -77,36 +78,77 @@ def atomic_write_text(path: Path, text: str):
     os.replace(str(tmp), str(path))
 
 
-_claude_exe_cache = None
+_agent_exe_cache = {}
 
 
-def get_claude_exe():
-    """返回 Claude Code CLI 可执行文件路径。环境变量 CLAUDE_EXE 优先。
+def get_agent_backend():
+    """Return configured LLM backend: claude or codex.
 
-    CLAUDE_EXE 接受：
-      - 绝对/相对路径（会校验 exists）
-      - 裸命令名（会走 PATH 查找）
+    Priority:
+      1. NEWS_ANALYST_AGENT environment variable
+      2. logs/.agent_backend file
+      3. codex (default)
     """
-    global _claude_exe_cache
-    if _claude_exe_cache:
-        return _claude_exe_cache
-    exe = os.environ.get("CLAUDE_EXE", "").strip()
+    backend = os.environ.get("NEWS_ANALYST_AGENT", "").strip().lower()
+    if not backend and AGENT_BACKEND_FILE.exists():
+        try:
+            backend = AGENT_BACKEND_FILE.read_text(encoding="utf-8").strip().lower()
+        except Exception:
+            backend = ""
+    backend = backend or "codex"
+    if backend not in {"claude", "codex"}:
+        raise RuntimeError(f"NEWS_ANALYST_AGENT must be 'claude' or 'codex', got {backend!r}")
+    return backend
+
+
+def get_agent_exe(backend):
+    """Return CLI executable path for the selected backend.
+
+    Environment overrides:
+      - CLAUDE_EXE for claude
+      - CODEX_EXE for codex
+    """
+    if backend in _agent_exe_cache:
+        return _agent_exe_cache[backend]
+    env_name = "CLAUDE_EXE" if backend == "claude" else "CODEX_EXE"
+    default_cmd = "claude" if backend == "claude" else "codex"
+    exe = os.environ.get(env_name, "").strip()
     if exe:
         if Path(exe).exists():
-            _claude_exe_cache = exe
+            _agent_exe_cache[backend] = exe
             return exe
         w = shutil.which(exe)
         if w:
-            _claude_exe_cache = w
+            _agent_exe_cache[backend] = w
             return w
-    w = shutil.which("claude")
+    w = shutil.which(default_cmd)
     if w:
-        _claude_exe_cache = w
+        _agent_exe_cache[backend] = w
         return w
     raise RuntimeError(
-        "未找到 Claude Code CLI（`claude`）。请安装 Claude Code 并确保 PATH 中有 claude，"
-        "或设置环境变量 CLAUDE_EXE 为 claude 的完整路径或命令名。"
+        f"未找到 {backend} CLI (`{default_cmd}`)。请安装并确保 PATH 中有 {default_cmd}，"
+        f"或设置环境变量 {env_name} 为完整路径或命令名。"
     )
+
+
+def get_agent_model(backend, requested_model):
+    """Translate legacy Claude tier names into backend-specific model names."""
+    requested_model = requested_model or CLAUDE_MODEL_ROUTINE
+    if backend == "claude":
+        return requested_model
+
+    codex_default = os.environ.get("CODEX_MODEL", "").strip()
+    if codex_default:
+        return codex_default
+    tier_map = {
+        CLAUDE_MODEL_ROUTINE: os.environ.get("CODEX_MODEL_ROUTINE", codex_default or "gpt-5.4-mini"),
+        CLAUDE_MODEL_BREAKING: os.environ.get("CODEX_MODEL_BREAKING", codex_default or "gpt-5.4"),
+        CLAUDE_MODEL_WEEKEND: os.environ.get("CODEX_MODEL_WEEKEND", codex_default or "gpt-5.4-mini"),
+        CLAUDE_MODEL_FORECAST: os.environ.get("CODEX_MODEL_FORECAST", codex_default or "gpt-5.5"),
+    }
+    if requested_model in tier_map:
+        return tier_map[requested_model]
+    return codex_default or requested_model
 
 
 def _popen_extra_kwargs():
@@ -192,41 +234,44 @@ BREAKING_PROMPT_TEMPLATE = (
     "   · 误报 / 地理误触发 / 付费墙复述旧观点 / 对金价零直接影响 → **不发推送**，只在 macro.md/log 里记录"
     "（理由：避免噪音污染 Trader 通道；用户明确指令'金价 0 影响的推送就不要发了'）\n"
     "\n"
-    "6. **推送格式 · v5 BREAKING 单事件交易员视角版**（决定要推时按此输出）：\n"
+    "6. **推送格式 · v6 BREAKING 紧凑中文版**（决定要推时严格按此输出，每段间一空行）：\n"
     "```\n"
-    "🚨 [SPIKE/INTRADAY·叙事级别·方向] 标题（数字+人名+机构·★级）\n"
+    "🚨 [SPIKE/INTRADAY·★级·方向] 标题（数字+人名+机构）\n"
     "📍 $X,XXX (距前次±$XX · ATR(7)≈$XX)\n"
-    "  ⚠️ 现价用 daemon 前置钩子注入的 MT5 实时价 (绝对 ground truth)\n"
-    "  ⚠️ 「距前次」是相对锚, 别和「今日」混; 要写「今日」必须用 today_change_dollar (vs broker D1 开)\n"
     "\n"
     "【事件】\n"
-    "<2-3 句详情，含数字+人名+机构+来源★级>\n"
+    "<2-3 句中文详情，含数字+人名+机构+来源★级>\n"
     "\n"
-    "【信号 surprise（如适用）】\n"
-    "actual X vs consensus Y = ±Nσ（或 '非数据，按事件增量'）\n"
+    "【信号】                                  ← 无数据/非数据事件时整段省略，不要留空标题\n"
+    "actual X vs consensus Y = ±Nσ\n"
     "\n"
-    "【跨市场快照 · 5min】\n"
-    "金 $X (±X%) | DXY XX (±X%) | Brent $X (±X%)\n"
-    "（如多市场数据可得，加 VIX/30Y）\n"
-    "共振: N/3（强 ✓✓✓ / 矛盾 ✗）\n"
+    "【跨市场·5min】                            ← 数据不可得时整段省略\n"
+    "金 $X (±X%) · DXY XX (±X%) · Brent $X (±X%) · 共振 N/3\n"
     "\n"
-    "【叙事级别】\n"
-    "A 新叙事 / B 旧叙事变量 / C 噪音\n"
-    "框架: [现有/新]\n"
-    "方向: [新方向解释 / 延续旧框架方向]\n"
-    "量化: ±$X~±$X，ATR 内/外\n"
+    "【叙事】 A/B/C · [框架中文名] · <延续/新方向 含量化 ±$X · ATR 内/外>\n"
     "\n"
-    "【交易意义】\n"
-    "时间窗: SPIKE / INTRADAY / SWING\n"
-    "持仓建议: 多头止盈 / 空头加仓 / 观望\n"
-    "持续性: 脉冲（5min）/ 数小时 / 改变叙事\n"
+    "【交易】 SPIKE/INTRADAY/SWING · 多头止盈/空头加仓/观望 · 脉冲/数h/改变叙事\n"
     "\n"
-    "【后续看点】\n"
-    "<下一事件 / 双向情景如适用>\n"
+    "【后续】 <下一事件 / 双向情景，1 行内>\n"
     "\n"
-    "【哑区/建议】\n"
-    "<暂避窗口 / 等确认 / 无哑区>\n"
+    "【哑区】 <暂避窗口 / 等确认 / 无哑区即可交易，1 行内>\n"
     "```\n"
+    "**版式硬规则**（违反=push 不合格）：\n"
+    "- 模板里所有 `← 注释` 和 `<占位>` 只是给你看的说明，**绝对不要复制**到 push body\n"
+    "- 不输出 `⚠️ 现价用...` / `⚠️ 今日只用...` 这种模板自带的元规则（那是给你看的约束，不是 push 内容）\n"
+    "- 【叙事】【交易】【后续】【哑区】各自 1 行，不要拆 3 个子标题分多行写\n"
+    "- 【信号】和【跨市场】数据不可得时**整段省略**（连标题一起删），不要保留空标题或写 '无数据'\n"
+    "- 段与段之间留一个空行；标题用全角【】，正文紧贴标题或下一行\n"
+    "\n"
+    "**HARD 强制中文**（push body 全中文，违反=重写）：\n"
+    "- 国会/政府：House=众议院 · Senate=参议院 · Congress=美国国会 · White House=白宫 · Fed=美联储 · ECB=欧央行 · BoJ=日央行 · PBoC=人民银行\n"
+    "- 决议/外交：war-powers resolution=战争权力决议 · veto=否决 · legal challenge=法律挑战 · ceasefire=停火协议 · framework agreement=框架协议 · MOU=谅解备忘录 · sanctions=制裁 · embargo=禁运 · détente/rapprochement=关系回暖\n"
+    "- 美联储：hawkish=偏鹰 · dovish=偏鸽 · pivot=政策转向 · taper=缩表 · cut=降息 · hold=按兵不动\n"
+    "- 通讯社：Reuters=路透 · AP=美联社 · Bloomberg=彭博 · WSJ=华尔街日报 · FT=金融时报 · NYT=纽约时报\n"
+    "- 【叙事】**括号内框架名也必须中文**：例 `[geopolitical war-powers]` → `[地缘·战争权力]`；`[fed-pivot]` → `[联储转向]`；`[RYCC]` → `[油-通胀-美元三重压金]`\n"
+    "- 数字 wire 速记必须翻译并保留原值：`49k`→`4.9 万 (49k)` · `150bp`→`150 个基点 (150bp)` · `517k`→`51.7 万 (517k)`；失业率/GDP/CPI 百分比和 $ 价格不翻\n"
+    "- 法案编号原样保留：`H.Con.Res. 86` 不译；数据缩写 (NFP/CPI/PPI/ISM/UoM) 首次出现需 `非农 (NFP)` 形式带中文翻译\n"
+    "- 句子里不许夹完整英文从句（'still needs Senate approval, and likely faces a veto' → '仍需参议院通过，且预计将遭白宫否决'）\n"
     "\n"
     "【BREAKING 影响分级标注 v2 · 严苛化】\n"
     "⭐ 必须严苛！多数 BREAKING 事件应在 ⭐⭐ 档（已 price-in/Trump 重复表态）。\n"
@@ -633,6 +678,7 @@ def fetch_price_preamble() -> str:
             [PYTHON_FOR_MT5, str(GET_PRICE_SCRIPT), "--full"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=PRICE_FETCH_TIMEOUT,
+            env={**os.environ, "MT5_BACKEND": "http", "MT5LINUX_PORT": "8101"},
         )
         stdout_txt = (result.stdout or b"").decode("utf-8", errors="replace").strip()
         stderr_txt = (result.stderr or b"").decode("utf-8", errors="replace").strip()
@@ -691,7 +737,7 @@ def lint_macro_for_price_violations(text: str) -> list:
 
 
 def post_cycle_macro_lint():
-    """cycle 完成后读 macro.md 检查；发现违规则写 log + 发小推送告警（不阻塞）。"""
+    """cycle 完成后读 macro.md 检查；发现违规仅写 log，不推送。"""
     try:
         if not MACRO_FILE.exists():
             return
@@ -701,13 +747,6 @@ def post_cycle_macro_lint():
             log(f"⚠️ macro.md lint 发现 {len(violations)} 处价位违规：")
             for lineno, content, idx in violations[:5]:
                 log(f"    L{lineno} pat#{idx}: {content}")
-            # 悄悄告警（让用户知道 daemon 越界了），但不推送到 Trader（避免污染 Trader 通道）
-            send_ntfy(
-                "⚠️[lint] macro.md 发现价位违规",
-                f"本轮 daemon 写入了 {len(violations)} 处具体支撑/阻力/入场价（分析师越界）。\n"
-                f"示例：L{violations[0][0]}: {violations[0][1]}\n"
-                f"请检查 CLAUDE.md 禁令是否生效（可能 session 未重建）。",
-            )
     except Exception as e:
         log(f"lint 异常: {e}")
 
@@ -803,6 +842,10 @@ def check_dumb_zone_triggers():
 
 
 def send_ntfy(title, body):
+    # Marker-file kill switch (shared with ntfy_push.py). Effective on next
+    # daemon restart for this function; ntfy_push.py picks it up immediately.
+    if (NEWS_HOME / ".push_disabled").exists():
+        return
     import json as _json
     from urllib.request import urlopen, Request
     try:
@@ -932,6 +975,15 @@ def get_or_create_session_id():
         sid = SESSION_FILE.read_text().strip()
         if sid:
             return sid, False
+    # One-time migration from the legacy Claude-only session file.
+    if LEGACY_SESSION_FILE.exists():
+        try:
+            sid = LEGACY_SESSION_FILE.read_text().strip()
+            if sid:
+                atomic_write_text(SESSION_FILE, sid)
+                return sid, False
+        except Exception:
+            pass
     return new_session_id(), True
 
 
@@ -956,21 +1008,41 @@ def kill_process_tree(proc):
         pass
 
 
-def run_claude(prompt, log_path, session_id, is_first, model=None):
-    """非交互执行 Claude Code：`claude -p` + `--session-id`(首次) 或 `--resume`(续会)。"""
-    exe = get_claude_exe()
-    cmd = [
-        exe,
-        "-p",
-        prompt,
-        "--output-format", "text",
-        "--model", model or CLAUDE_MODEL_ROUTINE,
-        "--permission-mode", "bypassPermissions",
-    ]
-    if is_first:
-        cmd += ["--session-id", session_id]
+def run_agent(prompt, log_path, session_id, is_first, model=None):
+    """Run the configured non-interactive agent backend.
+
+    Claude keeps the historical resumable session behavior. Codex currently runs
+    ephemeral cycles and relies on macro.md/forecast.md for continuity; this
+    avoids daemon stalls from backend session locks while keeping backend choice
+    parameterized.
+    """
+    backend = get_agent_backend()
+    exe = get_agent_exe(backend)
+    selected_model = get_agent_model(backend, model)
+    if backend == "claude":
+        cmd = [
+            exe,
+            "-p",
+            prompt,
+            "--output-format", "text",
+            "--model", selected_model,
+            "--permission-mode", "bypassPermissions",
+        ]
+        if is_first:
+            cmd += ["--session-id", session_id]
+        else:
+            cmd += ["--resume", session_id]
     else:
-        cmd += ["--resume", session_id]
+        cmd = [
+            exe, "--search",
+            "--ask-for-approval", "never",
+            "exec",
+            "--ephemeral",
+            "--cd", str(NEWS_HOME),
+            "--sandbox", "danger-full-access",
+            "--model", selected_model,
+            prompt,
+        ]
 
     proc = subprocess.Popen(
         cmd,
@@ -986,6 +1058,7 @@ def run_claude(prompt, log_path, session_id, is_first, model=None):
 
         with open(log_path, "w", encoding="utf-8") as f:
             f.write(f"=== 新闻分析师 {datetime.now()} ===\n")
+            f.write(f"后端: {backend}\n")
             f.write(f"会话: {session_id}\n")
             f.write(f"退出码: {proc.returncode}\n\n")
             f.write("--- 输出 ---\n")
@@ -1017,6 +1090,9 @@ def run_claude(prompt, log_path, session_id, is_first, model=None):
         with open(log_path, "w", encoding="utf-8") as f:
             f.write(f"=== 错误: {e} ===\n")
         return False, ""
+
+
+run_claude = run_agent  # backwards-compatible name used by existing call sites
 
 
 def should_send_weekend_summary() -> bool:
@@ -1158,7 +1234,7 @@ def _rebuild_session(session_id, reason=""):
 def _run_cycle(prompt, log_suffix, session_id, is_first_flag, cycle_count,
                consecutive_failures, last_success, last_session_rebuild,
                last_heartbeat, last_regular_cycle, is_breaking=False, model=None):
-    """执行一轮 Claude 周期，返回更新后的状态变量 dict。"""
+    """执行一轮分析师周期，返回更新后的状态变量 dict。"""
     label_map = {
         "breaking": f"🚨 突发响应",
         "first": "首次启动",
@@ -1174,7 +1250,7 @@ def _run_cycle(prompt, log_suffix, session_id, is_first_flag, cycle_count,
     cleanup_old_logs()
     mtime_before = macro_mtime()
 
-    # 前置钩子：注入 MT5 实时金价，Claude 不需要"记得"自己读
+    # 前置钩子：注入 MT5 实时金价，避免模型遗漏实时价格读取
     price_preamble = fetch_price_preamble()
     log(f"前置钩子价格: {price_preamble.splitlines()[1] if len(price_preamble.splitlines()) > 1 else price_preamble[:120]}")
     wrapped_prompt = f"{price_preamble}\n---\n\n{prompt}"
@@ -1243,10 +1319,12 @@ def main():
         return
 
     session_id, is_new = get_or_create_session_id()
+    backend = get_agent_backend()
     log("守护进程启动")
+    log(f"后端: {backend}")
     log(f"会话: {session_id} ({'新建' if is_new else '恢复'})")
     send_ntfy("[新闻分析师] 启动",
-              f"新闻分析师上线\n每6h常规扫描 + 突发即时响应\n会话: {session_id[:8]}...")
+              f"新闻分析师上线\n后端: {backend}\n每6h常规扫描 + 突发即时响应\n会话: {session_id[:8]}...")
 
     consecutive_failures = 0
     is_first = is_new
