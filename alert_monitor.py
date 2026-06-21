@@ -484,6 +484,129 @@ KEYWORDS: dict[str, int] = {
 }
 
 
+# ─── Fast-path geo gate ───────────────────────────────────────────────────────
+# Bypass daemon LLM cycle (~3min) for unambiguous Tier-1 keyword events.
+# alert_monitor writes news_signal.csv directly → EA cache reload in <10s.
+# daemon's later news_signal_writer.write_news_signal() refines (preserve or reset
+# clock per direction match) via its existing _read_existing logic.
+
+# Subset of Tier-1 keywords with UNAMBIGUOUS XAUUSD direction.
+# +1 = bullish XAUUSD (safe-haven flight / dovish surprise / bond stress)
+# -1 = bearish XAUUSD (de-escalation / hawkish surprise / risk-on)
+# Ambiguous (iran, israel, powell alone, ceasefire alone) are intentionally excluded.
+KEYWORD_DIRECTION_MAP: dict[str, int] = {
+    # ── +1 · safe-haven flight: military escalation ──
+    "missile strike":        +1, "military strike":      +1, "airstrike":            +1,
+    "drone strike":          +1, "bombing":              +1, "war declared":         +1,
+    "war breaks out":        +1, "ceasefire collapsed":  +1, "ceasefire expires":    +1,
+    "fighting resumes":      +1, "tanker attack":        +1, "tanker mined":         +1,
+    "tanker hit":            +1, "ship mined":           +1, "tanker boarded":       +1,
+    "ship attacked hormuz":  +1, "iran attacks tanker":  +1, "iran attacks ship":    +1,
+    "iran attacks escort":   +1, "iran attacks navy":    +1, "iran fires escort":    +1,
+    "iran sinks":            +1, "navy strikes iran":    +1, "us strikes iran":      +1,
+    "oil embargo":           +1,
+    "战争":                  +1, "开战":                 +1, "空袭":                 +1,
+    "轰炸":                  +1, "导弹袭击":             +1, "护航船被攻击":         +1,
+    "护航船触雷":            +1, "击沉护航":             +1, "击中护航":             +1,
+    # ── +1 · financial crisis / flight to safety ──
+    "bank collapse":         +1, "bank run":             +1, "market crash":         +1,
+    "circuit breaker":       +1, "trading halt":         +1, "sovereign default":    +1,
+    "flash crash":           +1, "treasury rout":        +1, "bond rout":            +1,
+    "bond massacre":         +1, "long bond crisis":     +1, "auction failed":       +1,
+    "weak treasury demand":  +1, "fed emergency qe":     +1, "operation twist":      +1,
+    "yield curve control":   +1, "ycc":                  +1, "fed buys treasuries":  +1,
+    "fed buying long bonds": +1,
+    "金融危机":              +1, "熔断":                 +1, "暴跌":                 +1,
+    "长债危机":              +1, "国债拍卖失败":         +1, "美联储紧急购债":       +1,
+    "美联储扭转操作":        +1, "收益率曲线控制":       +1,
+    # ── +1 · dovish Fed (lower real yields → gold up) ──
+    "emergency rate":        +1, "emergency cut":        +1, "rate cut":             +1,
+    "powell dovish":         +1, "powell pivot":         +1, "powell rate cut":      +1,
+    "rate cut path":         +1, "rate cut signal":      +1, "warsh dovish":         +1,
+    "fed pivot":             +1, "easing bias retained": +1, "july rate cut":        +1,
+    "july cut":              +1, "september rate cut":   +1, "september cut":        +1,
+    "december rate cut":     +1, "december cut":         +1, "support rate cut":     +1,
+    "backs rate cut":        +1, "calls for rate cut":   +1, "calls for cut":        +1,
+    "降息":                  +1, "鲍威尔鸽派":           +1, "鲍威尔转向":           +1,
+    "降息路径":              +1, "7月降息":              +1, "9月降息":              +1,
+    "12月降息":              +1, "支持降息":             +1, "呼吁降息":             +1,
+    # ── -1 · de-escalation / risk-on ──
+    "iran deal signed":      -1, "iran signed":          -1, "iran agreement signed": -1,
+    "iran accord":           -1, "peace deal signed":    -1, "mou signed":            -1,
+    "iran war ends":         -1, "hormuz open":          -1, "hormuz opens":          -1,
+    "hormuz reopens":        -1, "hormuz reopened":      -1, "hormuz cleared":        -1,
+    "霍尔木兹重开":          -1,
+    # ── -1 · hawkish Fed (higher real yields → gold down) ──
+    "rate hike":             -1, "powell hawkish":       -1, "warsh hawkish":         -1,
+    "easing bias removed":   -1, "july hike":            -1, "september hike":        -1,
+    "加息":                  -1, "鲍威尔鹰派":           -1,
+}
+
+# Sidecar paths for fast-path geo signal (mirrors news_signal_writer.py SIGNAL_FILE_PROD{,2})
+GEO_SIGNAL_PROD = Path(
+    "/data/mt5/data/.wine/drive_c/users/abc/AppData/Roaming/"
+    "MetaQuotes/Terminal/Common/Files/news_signal.csv"
+)
+GEO_SIGNAL_PROD2 = Path(
+    "/data/mt5/data-prod2/.wine/drive_c/users/abc/AppData/Roaming/"
+    "MetaQuotes/Terminal/Common/Files/news_signal.csv"
+)
+GEO_PRELIMINARY_TTL_SECS  = 14400  # 4h — matches news_signal_writer.GEO_TTL_SECS (EA staleness=2h is effective cap)
+GEO_PRELIMINARY_STRENGTH   = 0.50  # mid-tier (LLM may refine to 0.80 later via same-direction preserve)
+GEO_PRELIMINARY_CONFIDENCE = 0.50  # just at gate threshold (GEO_CONF_MIN=0.50)
+
+
+def infer_direction(matched_kws: list) -> int | None:
+    """Return +1/-1 from matched keywords if at least one direction-mapped keyword hit
+    AND all hits agree. Returns None if no direction-map hit OR conflicting directions."""
+    directions = set()
+    for kw in matched_kws:
+        if kw in KEYWORD_DIRECTION_MAP:
+            directions.add(KEYWORD_DIRECTION_MAP[kw])
+    if len(directions) == 1:
+        return next(iter(directions))
+    return None
+
+
+def write_preliminary_news_signal(direction: int, headline: str, score: int,
+                                   matched_kws: list) -> bool:
+    """Fast-path write to news_signal.csv. Bypasses daemon LLM cycle.
+
+    daemon's later news_signal_writer.write_news_signal() will:
+      - preserve our written_at + mute_until if LLM concludes same direction
+      - reset clock to LLM time if LLM disagrees direction
+    Either path is correct: preliminary gives <30s EA hedge; LLM refines within 3min.
+    """
+    if direction not in (-1, +1):
+        return False
+    now_ts = int(time.time())
+    timestamp = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    mute_until = now_ts + GEO_PRELIMINARY_TTL_SECS
+    content = (
+        "timestamp,direction,strength,mute_until,confidence\n"
+        f"{timestamp},{direction:+d},{GEO_PRELIMINARY_STRENGTH:.3f},"
+        f"{mute_until},{GEO_PRELIMINARY_CONFIDENCE:.3f}\n"
+    )
+    written = []
+    for sig_file in (GEO_SIGNAL_PROD, GEO_SIGNAL_PROD2):
+        try:
+            sig_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = sig_file.with_suffix(".csv.tmp")
+            tmp.write_text(content, encoding="utf-8")
+            os.replace(str(tmp), str(sig_file))
+            written.append(sig_file.parent.parent.name)  # 'data' or 'data-prod2' marker
+        except Exception as e:
+            logger.warning(f"[fast-path] 写入 {sig_file} 失败: {e}")
+    if written:
+        logger.warning(
+            f"⚡ FAST-PATH geo signal: dir={direction:+d} str={GEO_PRELIMINARY_STRENGTH} "
+            f"conf={GEO_PRELIMINARY_CONFIDENCE} mute=+4h kws={matched_kws} "
+            f"score={score} | {headline[:70]}"
+        )
+        return True
+    return False
+
+
 # ─── 工具函数 ─────────────────────────────────────────────────────────────────
 
 def _setup_logging() -> logging.Logger:
@@ -722,6 +845,11 @@ def poll_once(seen: set, recent_triggers: list) -> tuple:
                     continue
                 # 无论是否触发，高分事件都写入 sidecar 供 Opus 实时读取
                 append_geo_alert(item["title"], item["source"], score, matched)
+                # Fast-path geo gate: 若 keyword 方向无歧义，立即写 news_signal.csv 给 EA
+                # 绕过 daemon LLM cycle (~3min)，让 EA <30s 感知。daemon 后续 refine。
+                fast_dir = infer_direction(matched)
+                if fast_dir is not None:
+                    write_preliminary_news_signal(fast_dir, item["title"], score, matched)
                 # 如果触发文件已存在（daemon 尚未处理上一个），不覆盖，只记录
                 if TRIGGER_FILE.exists():
                     logger.info(f"触发器待处理中，跳过: score={score} {item['title'][:60]}")
