@@ -555,6 +555,12 @@ GEO_SIGNAL_PROD2 = Path(
 GEO_PRELIMINARY_TTL_SECS  = 14400  # 4h — matches news_signal_writer.GEO_TTL_SECS (EA staleness=2h is effective cap)
 GEO_PRELIMINARY_STRENGTH   = 0.50  # mid-tier (LLM may refine to 0.80 later via same-direction preserve)
 GEO_PRELIMINARY_CONFIDENCE = 0.50  # just at gate threshold (GEO_CONF_MIN=0.50)
+BAN_SHORT_SCORE_THRESHOLD  = 80    # auto-set ban_short in geo_alerts when Tier-1 escalation ≥ this
+V5_TRIGGER_SCORE_MIN       = 40    # immediately fire Opus A+B cycle when geo score hits this
+V5_TRIGGER_COOLDOWN_S      = 600   # don't fire more than once per 10 min
+
+V5_DEPLOY = Path("/home/admin/OpusWorkspace/AITraderV5/deploy")
+V5_DATA   = Path("/home/admin/OpusWorkspace/AITraderV5/data")
 
 
 def infer_direction(matched_kws: list) -> int | None:
@@ -680,6 +686,126 @@ def write_preliminary_news_signal(direction: int, headline: str, score: int,
         )
         return True
     return False
+
+
+def _enforce_ban_short_from_geo_alerts() -> bool:
+    """P0: If geo_alerts.json has ban_short=True (set manually or auto), refresh
+    news_signal.csv direction=+1 so the EA blocks SHORT within 10s.
+    Noop when ban_short not set. Expires only when the most recent score≥50 alert
+    is >24h old (covers weekend gaps where no new alerts arrive for hours).
+    On each successful enforce, refreshes geo_alerts last_updated to stay alive."""
+    if not GEO_ALERT_FILE.exists():
+        return False
+    try:
+        data = json.loads(GEO_ALERT_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not data.get("ban_short"):
+        return False
+    # Expiry: find most recent high-score alert (≥50); ban active while it's within 24h.
+    # Using alert time (not last_updated) so weekend silence doesn't prematurely expire.
+    BAN_EXPIRY_H = 24
+    now_ts = datetime.now(timezone.utc).timestamp()
+    alerts = data.get("alerts", [])
+    anchor_ts = None
+    for a in sorted(alerts, key=lambda x: x.get("time", ""), reverse=True):
+        if a.get("score", 0) >= 50:
+            try:
+                anchor_ts = datetime.fromisoformat(a["time"]).timestamp()
+                break
+            except Exception:
+                pass
+    if anchor_ts is None:
+        # No high-score alert: fall back to last_updated with 4h window
+        try:
+            anchor_ts = datetime.fromisoformat(data["last_updated"]).timestamp()
+            BAN_EXPIRY_H = 4
+        except Exception:
+            return False
+    if (now_ts - anchor_ts) > BAN_EXPIRY_H * 3600:
+        return False
+    reason = data.get("ban_short_reason", "geo ban_short active")
+    ok = write_preliminary_news_signal(+1, f"[ban_short] {reason[:60]}", 99, [])
+    if ok:
+        logger.warning(f"⚡ [ban_short] 强制 news_signal.csv dir=+1: {reason[:60]}")
+        # Refresh last_updated so the file stays "alive" through weekend silence
+        try:
+            data["last_updated"] = datetime.now(timezone.utc).isoformat()
+            tmp = GEO_ALERT_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(str(tmp), str(GEO_ALERT_FILE))
+        except Exception:
+            pass
+    return ok
+
+
+def _is_xauusd_market_open() -> bool:
+    """XAUUSD 闭市判定 (Friday 21:00 UTC ~ Sunday 21:00 UTC). Keeps V5 trigger quiet on weekends."""
+    now = datetime.now(timezone.utc)
+    wd, h = now.weekday(), now.hour + now.minute / 60.0
+    if wd == 4 and h >= 21: return False
+    if wd == 5: return False
+    if wd == 6 and h < 21: return False
+    return True
+
+
+def _trigger_v5_geo_cycle(headline: str, score: int, direction: int) -> bool:
+    """P2: Immediately fire Opus A + B decision cycles when a high-score geo event is detected.
+    Skips when: market closed, V5 already running, or within 10-min cooldown."""
+    import subprocess
+
+    if not _is_xauusd_market_open():
+        logger.info(f"[v5-trigger] 闭市中，跳过 V5 触发 (score={score})")
+        return False
+
+    # Cooldown: avoid flooding V5 with repeated triggers for the same story
+    cooldown_file = LOG_DIR / ".v5_last_triggered"
+    if cooldown_file.exists():
+        age = time.time() - cooldown_file.stat().st_mtime
+        if age < V5_TRIGGER_COOLDOWN_S:
+            logger.info(f"[v5-trigger] 冷却中 ({age:.0f}s < {V5_TRIGGER_COOLDOWN_S}s)，跳过")
+            return False
+
+    # Skip if any Opus router is already running (prevent concurrent LLM calls)
+    running = subprocess.run(
+        ["pgrep", "-f", "opus_mt5_router.py"],
+        capture_output=True,
+    ).returncode == 0
+    if running:
+        logger.info("[v5-trigger] opus_mt5_router.py 正在运行，跳过重复触发")
+        return False
+
+    # Stamp cooldown before spawning (prevents race if this function called twice)
+    cooldown_file.touch()
+
+    dir_zh = "多" if direction > 0 else "空"
+    fired = []
+    for script_name, log_rel in [
+        ("prod_opus_run.sh",  "opus_router/router.log"),
+        ("prod_opusb_run.sh", "opus_b_router/router.log"),
+    ]:
+        script = V5_DEPLOY / script_name
+        log    = V5_DATA   / log_rel
+        if not script.exists():
+            continue
+        try:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with open(log, "ab") as fh:
+                subprocess.Popen(
+                    ["bash", str(script), "--push"],
+                    stdout=fh, stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            fired.append(script_name)
+        except Exception as e:
+            logger.warning(f"[v5-trigger] 启动 {script_name} 失败: {e}")
+
+    if fired:
+        logger.warning(
+            f"⚡ [v5-trigger] 触发 {'+'.join(fired)}: "
+            f"score={score} dir={dir_zh} | {headline[:60]}"
+        )
+    return bool(fired)
 
 
 # ─── 工具函数 ─────────────────────────────────────────────────────────────────
@@ -852,19 +978,25 @@ def write_trigger(headline: str, source: str, score: int, matched_kws: list):
     logger.warning(f"🚨 突发触发！score={score} [{source}] {headline[:80]}")
 
 
-def append_geo_alert(headline: str, source: str, score: int, matched_kws: list):
-    """将高分事件追加到 AITraderV5 geo_alerts sidecar，绕过 daemon 延迟直达 Opus prompt。"""
+def append_geo_alert(headline: str, source: str, score: int, matched_kws: list,
+                     direction: int | None = None):
+    """将高分事件追加到 AITraderV5 geo_alerts sidecar，绕过 daemon 延迟直达 Opus prompt。
+    P0: 当 score≥BAN_SHORT_SCORE_THRESHOLD 且 direction=+1 时自动设置 ban_short=True。"""
     if score < GEO_ALERT_SCORE_MIN:
         return
     try:
         now = datetime.now(timezone.utc)
         cutoff = now.timestamp() - GEO_ALERT_MAX_AGE_H * 3600
-        # 读取现有条目
+        # 读取现有条目 + 保留 ban_short 状态
         existing = []
+        prev_ban_short = False
+        prev_ban_reason = ""
         if GEO_ALERT_FILE.exists():
             try:
                 data = json.loads(GEO_ALERT_FILE.read_text(encoding="utf-8"))
                 existing = data.get("alerts", [])
+                prev_ban_short = data.get("ban_short", False)
+                prev_ban_reason = data.get("ban_short_reason", "")
             except Exception:
                 existing = []
         # 剔除过期条目
@@ -885,7 +1017,18 @@ def append_geo_alert(headline: str, source: str, score: int, matched_kws: list):
                 "score":    score,
                 "keywords": matched_kws,
             })
-        payload = {"last_updated": now.isoformat(), "alerts": existing}
+        # P0: auto-set ban_short when score≥threshold and direction unambiguously bullish;
+        # preserve existing ban_short if previously set (manual or prior auto-set).
+        auto_ban = (score >= BAN_SHORT_SCORE_THRESHOLD and direction == +1)
+        ban_short = auto_ban or prev_ban_short
+        if auto_ban and not prev_ban_short:
+            ban_reason = f"score={score} Tier-1 escalation: {headline[:80]}"
+            logger.warning(f"⚡ [ban_short] 自动触发: {ban_reason[:80]}")
+        else:
+            ban_reason = prev_ban_reason
+        payload = {"last_updated": now.isoformat(), "ban_short": ban_short, "alerts": existing}
+        if ban_short and ban_reason:
+            payload["ban_short_reason"] = ban_reason
         GEO_ALERT_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = GEO_ALERT_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -899,6 +1042,10 @@ def poll_once(seen: set, recent_triggers: list) -> tuple:
     new_seen = set(seen)
     new_recent = list(recent_triggers)
     triggered = False
+
+    # P0: enforce ban_short from geo_alerts.json every poll cycle
+    # Handles manually-set ban_short (analyst override) + previously auto-set entries.
+    _enforce_ban_short_from_geo_alerts()
 
     for name, url in RSS_FEEDS:
         items = fetch_feed(name, url)
@@ -919,11 +1066,13 @@ def poll_once(seen: set, recent_triggers: list) -> tuple:
                     )
                     continue
                 # 无论是否触发，高分事件都写入 sidecar 供 Opus 实时读取
-                append_geo_alert(item["title"], item["source"], score, matched)
+                # P0: pass fast_dir so append_geo_alert can auto-set ban_short on score≥80
+                fast_dir = infer_direction(matched)
+                append_geo_alert(item["title"], item["source"], score, matched,
+                                 direction=fast_dir)
                 # Fast-path geo gate: 若 keyword 方向无歧义，立即写 news_signal.csv 给 EA
                 # 绕过 daemon LLM cycle (~3min)，让 EA <30s 感知。daemon 后续 refine。
                 wrote_anything = False
-                fast_dir = infer_direction(matched)
                 if fast_dir is not None:
                     text_for_negation = item["title"] + " " + item.get("desc", "")
                     if has_directional_negation(text_for_negation, matched):
@@ -946,6 +1095,9 @@ def poll_once(seen: set, recent_triggers: list) -> tuple:
                 # (SIGUSR1 → daemon 跳出 sleep,LLM cycle 立即跑,refine CSV)
                 if wrote_anything and wake_daemon():
                     logger.info(f"[wake-daemon] SIGUSR1 → daemon (refine ASAP)")
+                # P2: 高分+方向明确事件直接触发 V5 Opus A+B cycle（跳过 30min 等待）
+                if score >= V5_TRIGGER_SCORE_MIN and fast_dir is not None:
+                    _trigger_v5_geo_cycle(item["title"], score, fast_dir)
 
     # 剪枝过期记录
     cutoff = time.time() - STORY_COOLDOWN_MIN * 60
