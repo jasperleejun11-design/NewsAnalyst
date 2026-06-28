@@ -109,21 +109,42 @@ def _shot_switch_post(key: str, on: bool, timeout: float = 10.0) -> dict:
 
 def disarm() -> tuple[bool, dict]:
     """POST shot_switch to set mgc.master=false AND mgc.enabled=false.
-    Returns (ok, info_dict)."""
+    Returns (ok, info_dict).
+
+    GAP-1 fix (2026-06-28 review): shot_switch returns 200 even when
+    its ssh fanout to hk-ecs fails ("sync.mgc.hk-ecs": "FAIL: ..."),
+    because the canonical file on this host did write. But the daemon
+    on hk-ecs reads its own local config file, so a fanout failure =
+    daemon NEVER sees disarm = next enabled OFF→ON could still fire.
+    We must inspect sync.mgc.hk-ecs and treat FAIL as disarm failure.
+
+    Order matters: enabled=false first (immediate edge-fire prevention),
+    master=false second (puts daemon in slow-poll). If first succeeds
+    and second fails, daemon is still safe (enabled=false blocks fire).
+    """
     info = {"steps": []}
-    try:
-        r1 = _shot_switch_post("enabled", on=False)
-        info["steps"].append({"step": "enabled=false", "ok": True, "sync": r1.get("sync", {})})
-    except Exception as e:
-        info["steps"].append({"step": "enabled=false", "ok": False, "error": str(e)})
-        return False, info
-    try:
-        r2 = _shot_switch_post("master", on=False)
-        info["steps"].append({"step": "master=false", "ok": True, "sync": r2.get("sync", {})})
-    except Exception as e:
-        info["steps"].append({"step": "master=false", "ok": False, "error": str(e)})
-        return False, info
-    # Verify final state from canonical
+    for key, on, label in (("enabled", False, "enabled=false"),
+                           ("master",  False, "master=false")):
+        try:
+            r = _shot_switch_post(key, on=on)
+        except Exception as e:
+            info["steps"].append({"step": label, "ok": False, "error": str(e)})
+            return False, info
+        sync = r.get("sync", {})
+        mgc_sync = sync.get("mgc.hk-ecs", "?")
+        canonical_sync = sync.get("canonical", "?")
+        step_ok = (canonical_sync == "ok" and mgc_sync == "ok")
+        info["steps"].append({
+            "step": label, "ok": step_ok,
+            "sync": sync,
+            "mgc_hk_ecs": mgc_sync,
+        })
+        if not step_ok:
+            # canonical may have written but daemon won't see the change
+            # if ssh fanout to hk-ecs failed. Operator must investigate.
+            return False, info
+
+    # Verify final canonical state (sanity)
     try:
         with urllib.request.urlopen(f"{SHOT_SWITCH_URL}/api/config", timeout=10) as resp:
             cfg = json.loads(resp.read().decode("utf-8"))
@@ -134,13 +155,25 @@ def disarm() -> tuple[bool, dict]:
 
 
 def force_close_remote(mode: str, reason: str, timeout: float = 60.0) -> tuple[bool, dict]:
-    """ssh hk-ecs 调 force_close helper — returns (ok, parsed_json_or_err)."""
+    """ssh hk-ecs 调 force_close helper — returns (ok, parsed_json_or_err).
+
+    GAP-3 fix (2026-06-28 review): /home/admin/.futu_trade_creds is
+    root:root mode 600 on hk-ecs (only systemd reads it). ssh-as-admin
+    can't `.` (source) it directly → FUTU_TRADE_PWD stays empty →
+    force_close --mode live raises RuntimeError before any broker call.
+    admin has NOPASSWD sudo (`(ALL) NOPASSWD: ALL` in sudoers), so we
+    load creds via `sudo -n cat` + `eval` inside `set -a` to export.
+    `&&` chain (vs original `;`) makes any failure fast-fail clearly
+    instead of silently running python with no creds.
+    """
     remote_cmd = (
-        f"cd /home/admin/HK_Research && "
-        f"set -a; . /home/admin/.futu_trade_creds 2>/dev/null; set +a; "
-        f"{HK_ECS_PY} -m {HK_ECS_FORCE_CLOSE_MODULE} "
-        f"--mode {mode} "
-        f"--reason {json.dumps(reason)}"
+        "cd /home/admin/HK_Research"
+        " && set -a"
+        ' && eval "$(sudo -n cat /home/admin/.futu_trade_creds 2>/dev/null)"'
+        " && set +a"
+        f" && {HK_ECS_PY} -m {HK_ECS_FORCE_CLOSE_MODULE}"
+        f" --mode {mode}"
+        f" --reason {json.dumps(reason)}"
     )
     try:
         proc = subprocess.run(
@@ -155,13 +188,22 @@ def force_close_remote(mode: str, reason: str, timeout: float = 60.0) -> tuple[b
         return False, {"error": f"ssh hk-ecs invocation failed: {e}"}
     out = proc.stdout.strip()
     err = proc.stderr.strip()
-    # Try to parse the LAST line of stdout as JSON (force_close prints one JSON line)
+    # GAP-4 fix (2026-06-28 review): Futu SDK's logger writes to STDOUT
+    # (e.g. "open_context_base.py:410 _init_connect_sync: New connect
+    # ready..." and on_disconnect lines), interleaved with force_close's
+    # own JSON line. Original code took the LAST stdout line as JSON,
+    # but Futu's disconnect logs come AFTER the JSON, so parsed=None
+    # falsely. Walk lines bottom-up, return first parseable JSON.
     parsed = None
-    if out:
+    for line in reversed(out.splitlines()):
+        s = line.strip()
+        if not (s.startswith("{") and s.endswith("}")):
+            continue
         try:
-            parsed = json.loads(out.splitlines()[-1])
+            parsed = json.loads(s)
+            break
         except Exception:
-            pass
+            continue
     info = {"rc": proc.returncode, "stdout": out, "stderr": err, "parsed": parsed}
     ok = (proc.returncode == 0)
     return ok, info
