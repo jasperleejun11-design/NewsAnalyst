@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.11
+#!/usr/bin/env python3
 """一键关停 Shot-XAUUSD(给 NewsAnalyst 调用)。
 
 调用场景:NewsAnalyst 检测到 ⭐⭐⭐ 反转 / 风险信号(如 Iran 突然停火 / Fed
@@ -100,32 +100,46 @@ def _shot_switch_post(key: str, on: bool, timeout: float = 10.0) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _step_ok(step: dict) -> bool:
+    if not step.get("ok"):
+        return False
+    sync = step.get("sync", {})
+    return all(sync.get(f"xauusd.{p}") == "ok" for p in ("prod", "prod2", "prod3"))
+
+
 def disarm() -> tuple[bool, dict]:
-    """POST shot_switch to set xauusd.enabled=false then xauusd.master=false.
-    Order matters: kill the fire trigger FIRST so a 1s-race can't sneak a fire
-    in between the two writes. Returns (full_ok, info_dict).
-    full_ok = True only if BOTH POSTs succeeded AND all 3 prod fanout = ok."""
+    """POST shot_switch to set xauusd.enabled=false AND xauusd.master=false.
+
+    Order: enabled=false FIRST (kills fire edge before master=false drops the
+    fast-poll, so a 1s race can't sneak a fire through).
+
+    Independence: each step tries even if the previous failed — failures can
+    be transient (one POST timeout) and we want maximum disarm effort. The
+    final assessment combines both step outcomes.
+
+    Returns (full_ok, info_dict).
+    full_ok = True iff BOTH steps' POSTs returned 200 AND both showed all 3
+    xauusd per-prod fanout=ok in their sync response."""
     info: dict = {"steps": []}
 
-    # Step a: enabled OFF (kills fire edge first)
+    # Step a: enabled OFF
     try:
         r1 = _shot_switch_post("enabled", on=False)
         sync = r1.get("sync", {})
         info["steps"].append({"step": "enabled=false", "ok": True, "sync": sync})
     except Exception as e:
         info["steps"].append({"step": "enabled=false", "ok": False, "error": str(e)})
-        return False, info
 
-    # Step b: master OFF (drops EA back to SLOW(30s) polling)
+    # Step b: master OFF (ALWAYS try, even if step a failed — master=OFF alone
+    # drops EA back to SLOW(30s) polling which itself prevents fast-edge fire)
     try:
         r2 = _shot_switch_post("master", on=False)
         sync = r2.get("sync", {})
         info["steps"].append({"step": "master=false", "ok": True, "sync": sync})
     except Exception as e:
         info["steps"].append({"step": "master=false", "ok": False, "error": str(e)})
-        return False, info
 
-    # Step c: read back canonical to confirm final state + per-prod sync
+    # Step c: best-effort read back canonical to confirm final state
     try:
         with urllib.request.urlopen(f"{SHOT_SWITCH_URL}/api/config", timeout=10) as resp:
             cfg = json.loads(resp.read().decode("utf-8"))
@@ -133,12 +147,8 @@ def disarm() -> tuple[bool, dict]:
     except Exception as e:
         info["final_xauusd_read_err"] = str(e)
 
-    # full_ok: both steps OK AND all 3 prod targets in last POST showed "ok"
-    last_sync = info["steps"][-1].get("sync", {})
-    all_prods_ok = all(
-        last_sync.get(f"xauusd.{p}") == "ok" for p in ("prod", "prod2", "prod3")
-    )
-    return all_prods_ok, info
+    full_ok = all(_step_ok(s) for s in info["steps"])
+    return full_ok, info
 
 
 def main() -> int:
@@ -164,9 +174,22 @@ def main() -> int:
     final_enabled = final.get("enabled")
     canonical_safe = (final_master is False and final_enabled is False)
 
-    last_sync = disarm_info.get("steps", [{}])[-1].get("sync", {})
-    per_prod = {p: last_sync.get(f"xauusd.{p}", "?") for p in ("prod", "prod2", "prod3")}
-    failed_prods = [p for p, s in per_prod.items() if s != "ok"]
+    # Per-step breakdown — needed to report WHICH step failed (vs the older
+    # last-step-only check that wrongly blamed all-prod-fanout when step 1
+    # passed and step 2 errored before producing any sync info).
+    steps = disarm_info.get("steps", [])
+    step_enabled = next((s for s in steps if s.get("step") == "enabled=false"), {})
+    step_master  = next((s for s in steps if s.get("step") == "master=false"),  {})
+    enabled_ok = _step_ok(step_enabled)
+    master_ok  = _step_ok(step_master)
+
+    # Failed prods: union across both steps where sync wasn't "ok"
+    failed_prods: list[str] = []
+    for s in (step_enabled, step_master):
+        sync = s.get("sync", {})
+        for p in ("prod", "prod2", "prod3"):
+            if sync.get(f"xauusd.{p}") != "ok" and p not in failed_prods:
+                failed_prods.append(p)
 
     # Success criteria = our 2 POSTs returned cleanly with 3-prod fanout = ok.
     # The "final canonical" read is informational: if another writer (web UI
@@ -201,14 +224,22 @@ def main() -> int:
             print(json.dumps(overall, ensure_ascii=False))
         return 0
 
-    # full_ok=False → at least one POST or fanout failed
-    if failed_prods:
+    # full_ok=False → at least one step had POST error or per-prod fanout fail
+    # Distinguish: (a) both steps' POSTs landed but fanout partial vs
+    #              (b) one or both POSTs errored out
+
+    enabled_post_ok = step_enabled.get("ok") is True
+    master_post_ok  = step_master.get("ok")  is True
+    both_posts_landed = enabled_post_ok and master_post_ok
+
+    if both_posts_landed:
+        # POSTs returned 200 but at least one prod's fanout reported FAIL
         _push_ntfy(
             "[Shot-XAUUSD] DISARM PARTIAL ⚠",
             f"reason: {args.reason}\n"
-            f"shot_switch POSTs ok but per-prod fanout 部分失败: {failed_prods}\n"
-            f"sync detail: {json.dumps(per_prod, ensure_ascii=False)}\n"
-            f"those prods may still be armed — VNC check ASAP",
+            f"shot_switch POSTs 都 200 OK but per-prod fanout 失败: {failed_prods}\n"
+            f"那些 prod 文件未更新, EA 仍读老 config — VNC check ASAP\n"
+            f"steps: {json.dumps(steps, ensure_ascii=False)}",
             priority="urgent",
         )
         _log({"action": "xauusd_shot_close", "ok": False, "stage": "fanout_partial",
@@ -217,13 +248,28 @@ def main() -> int:
             print(json.dumps(overall, ensure_ascii=False))
         return 1
 
-    # POST itself errored (no sync info available)
+    # At least one POST errored. Report which step + whether the OTHER step
+    # got us partial safety (master=OFF alone is enough to drop EA to SLOW
+    # poll, which blocks fast-edge fire; enabled=OFF alone removes the trigger).
+    partial_safety = []
+    if enabled_post_ok:
+        partial_safety.append("enabled=OFF landed (fire edge removed)")
+    if master_post_ok:
+        partial_safety.append("master=OFF landed (EA → SLOW 30s poll)")
+    safety_note = (
+        "PARTIAL SAFETY: " + " + ".join(partial_safety)
+        if partial_safety else
+        "NO disarm landed — EA may STILL be armed"
+    )
+    failed_steps = [s.get("step") for s in steps if not s.get("ok")]
+
     _push_ntfy(
         "[Shot-XAUUSD] DISARM FAILED ⚠⚠",
         f"reason: {args.reason}\n"
-        f"shot_switch POST failed; EA may still be armed!\n"
+        f"shot_switch POST 失败: {failed_steps}\n"
+        f"{safety_note}\n"
         f"manual fallback: ssh new-va, edit /data/shot/shot_config.json directly\n"
-        f"steps: {json.dumps(disarm_info.get('steps'), ensure_ascii=False)}",
+        f"steps: {json.dumps(steps, ensure_ascii=False)}",
         priority="urgent",
     )
     _log({"action": "xauusd_shot_close", "ok": False, "stage": "disarm_failed",
