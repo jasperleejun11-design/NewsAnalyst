@@ -62,7 +62,7 @@ _MODEL_OVERRIDE = os.environ.get("CLAUDE_MODEL", "")
 CLAUDE_MODEL_ROUTINE  = _MODEL_OVERRIDE or "haiku"   # 常规6h扫描：便宜快速
 CLAUDE_MODEL_BREAKING = _MODEL_OVERRIDE or "sonnet"  # 突发事件：需要判断力
 CLAUDE_MODEL_WEEKEND  = _MODEL_OVERRIDE or "haiku"   # 周末汇总：信息整理为主
-CLAUDE_MODEL_FORECAST = _MODEL_OVERRIDE or "opus"    # 每日研究员推演：深度论据 + 多框架推理，用 opus
+CLAUDE_MODEL_FORECAST = _MODEL_OVERRIDE or "sonnet"  # 每日研究员推演：2026-07-09 opus→sonnet（sonnet-4-6 推理已足够，opus 调用清零）
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -189,7 +189,8 @@ FIRST_PROMPT = (
     "- 最终简报必须全部用中文撰写，英文信息翻译成中文\n\n"
     f"现在开始搜索，然后写一份完整的 {MACRO_PATH_STR}。\n\n"
     "每次更新完 macro.md 后，必须发一条 ntfy 推送摘要（用绝对路径调用，避免 cwd 干扰）：\n"
-    f"  python {NTFY_SCRIPT} \"[新闻分析师] 标题\" \"摘要正文\"\n"
+    f"  python {NTFY_SCRIPT} '[新闻分析师] 标题' '摘要正文'\n"
+    "  **必须用单引号包 args**,防止 bash 把 $4,131 展开成 ,131\n"
     "推送要简短有力（3-5个要点），全部中文，让老板手机上一眼看懂当前局势。\n\n"
     "记住：你只分析不交易。给方向判断，不给具体买卖点。\n"
 )
@@ -213,7 +214,7 @@ CYCLE_PROMPT = (
     "   · **无实质变化但有下一节点价值** → 发✅小推送（≤2 行：现价 + 下一关键节点 + 倒计时）\n"
     "   · **完全零信息**（叙事无变 + 无下一近期节点 + 用户已知信息）→ **不发推送**，只在 log 写一句\"本轮无推送：理由 XX\"\n"
     "     用户明确指令'金价 0 影响的推送就不要发了'——降噪优先\n"
-    f"   推送命令：python {NTFY_SCRIPT} \"标题\" \"正文\"\n"
+    f"   推送命令(必须用单引号包 args,防止 bash 吞 $):python {NTFY_SCRIPT} '标题' '正文'\n"
     "\n"
     "【硬禁令】禁止写具体支撑/阻力/进场价（'$4,680支撑''$4,860阻力''$4,750中期买点'都违规，daemon 会扫描 lint）。\n"
 )
@@ -242,93 +243,87 @@ BREAKING_PROMPT_TEMPLATE = (
     "   · 误报 / 地理误触发 / 付费墙复述旧观点 / 对金价零直接影响 → **不发推送**，只在 macro.md/log 里记录"
     "（理由：避免噪音污染 Trader 通道；用户明确指令'金价 0 影响的推送就不要发了'）\n"
     "\n"
-    "6. **推送格式 · v6 BREAKING 紧凑中文版**（决定要推时严格按此输出，每段间一空行）：\n"
-    "```\n"
-    "🚨 [SPIKE/INTRADAY·★级·方向] 标题（数字+人名+机构）\n"
-    "📍 $X,XXX (距前次±$XX · ATR(7)≈$XX)\n"
+    "6. **推送格式 · v7 研究员简报风格**（2026-07-03 立·反 AI 感·反模板腔）\n"
     "\n"
-    "【事件】\n"
-    "<2-3 句中文详情，含数字+人名+机构+来源★级>\n"
+    "写 250-350 字自然段落文本，像顶级卖方研究员在客户 IM 群里发讲话。**禁止 【】block 标题、禁止表格、禁止 emoji bullet、禁止参数标签、禁止段首模板套话**。\n"
     "\n"
-    "【信号】                                  ← 无数据/非数据事件时整段省略，不要留空标题\n"
-    "actual X vs consensus Y = ±Nσ\n"
+    "**3 段结构**（段之间留一个空行，段内自然叙述，禁用小标题）：\n"
     "\n"
-    "【跨市场·5min】                            ← 数据不可得时整段省略\n"
-    "金 $X (±X%) · DXY XX (±X%) · Brent $X (±X%) · 共振 N/3\n"
+    "第 1 段（60-100 字）事件 + 核心数据：\n"
+    "- 直接说\"发生了什么\"，数字/人名/机构直接嵌入句子（不搞【事件】标题）\n"
+    "- 若是数据事件，actual vs 预期 vs 前值 顺畅写进句子（不搞【信号】block）\n"
     "\n"
-    "【叙事】 A/B/C · [框架中文名] · <延续/新方向 含量化 ±$X · ATR 内/外>\n"
+    "第 2 段（100-150 字）传导 + 跨市场反应：\n"
+    "- 一句话说清传导（事件 → 机制 → 金价影响）\n"
+    "- 相关资产反应自然嵌入：DXY、10 年美债、油、DXY 等，只写有意义的（不搞【跨市场】block）\n"
+    "- 若是旧叙事延续（B 类），一句话点明；若是新叙事（A 类），说清新逻辑链\n"
     "\n"
-    "【交易】 SPIKE/INTRADAY/SWING · 多头止盈/空头加仓/观望 · 脉冲/数h/改变叙事\n"
+    "第 3 段（80-120 字）方向 + 关键位 + 下一 test point：\n"
+    "- 方向判断（利多/利空/中性）+ 幅度（±$X 量级）\n"
+    "- 关键位一句话（如\"$4,110 附近是好入场\"、\"$4,130 上方追多不划算\"）\n"
+    "- 下一个数据/事件 / 哑区 一句话\n"
+    "- **必须** 在段内某处嵌入 ⭐ 评级（例：\"整体判定 ⭐⭐⭐⭐ 显著催化\"）——下游 push 分类必需信号\n"
     "\n"
-    "【后续】 <下一事件 / 双向情景，1 行内>\n"
+    "**硬规则**（违反=重写）：\n"
+    "- 全中文，数字带单位：$4,131 / +2.6% / -9.1pt / 100.58 / 4.485%\n"
+    "- 数字用 $4,131 或 $4131 格式，**禁止 $ 被吞成 ',131'**（写数字前必须显式带 $ 符号）\n"
+    "- **禁术语**：\"叙事\" / \"变盘点\" / \"锁笼\" / \"供给区\" / \"regime\" / \"COT\" / \"breakeven\" / \"real yield 压缩\"\n"
+    "  → 换人话：\"市场对经济走向的看法\" / \"扣掉通胀后的利率\" / \"油+美元+利率三重压金\" / \"前多头堆积价位\"\n"
+    "- **禁段首模板**：\"我的判断：\" / \"我看不同：\" / \"三个关键剧本：一，...二，...\" / \"现在动作：\"\n"
+    "  → 想说观点就直接说，别加冒号标签；剧本用自然叙述（\"一个偏空场景是...，另一种情况若...\"）\n"
+    "- **禁参数标签**：`score=` / `conv=` / `USD=` / `fed=` / `geo=` / `zones=` **绝不进 push body**\n"
+    "- **禁 【】block 标题**：不要写 \"【事件】\"、\"【信号】\"、\"【叙事】\"、\"【交易】\"、\"【后续】\"、\"【哑区】\"\n"
+    "- **禁分区表格**：\"3960-4120 加仓 ×1.80\" 这种分区表格是给 EA 看的，进 macro.md，**不进 push body**\n"
+    "- ⭐ 评级放正文里一处（\"判定 ⭐⭐⭐ 中等催化\"），不占一行、不加 【】 block\n"
+    "- emoji 克制：标题 1 个（🚨/📈/📉），body 最多 1 个\n"
     "\n"
-    "【哑区】 <暂避窗口 / 等确认 / 无哑区即可交易，1 行内>\n"
-    "```\n"
-    "**版式硬规则**（违反=push 不合格）：\n"
-    "- 模板里所有 `← 注释` 和 `<占位>` 只是给你看的说明，**绝对不要复制**到 push body\n"
-    "- 不输出 `⚠️ 现价用...` / `⚠️ 今日只用...` 这种模板自带的元规则（那是给你看的约束，不是 push 内容）\n"
-    "- 【叙事】【交易】【后续】【哑区】各自 1 行，不要拆 3 个子标题分多行写\n"
-    "- 【信号】和【跨市场】数据不可得时**整段省略**（连标题一起删），不要保留空标题或写 '无数据'\n"
-    "- 段与段之间留一个空行；标题用全角【】，正文紧贴标题或下一行\n"
+    "**语气示范**（参考风格，不要直接抄内容）：\n"
+    "\"NFP 6 月新增 5.7 万，预期 11.5 万，前两月还合计下修 7.4 万——就业市场明显降温。失业率降到 4.2%，但主因是劳动参与率下降，不是就业真强。\n"
     "\n"
-    "**HARD 强制中文**（push body 全中文，违反=重写）：\n"
-    "- 国会/政府：House=众议院 · Senate=参议院 · Congress=美国国会 · White House=白宫 · Fed=美联储 · ECB=欧央行 · BoJ=日央行 · PBoC=人民银行\n"
-    "- 决议/外交：war-powers resolution=战争权力决议 · veto=否决 · legal challenge=法律挑战 · ceasefire=停火协议 · framework agreement=框架协议 · MOU=谅解备忘录 · sanctions=制裁 · embargo=禁运 · détente/rapprochement=关系回暖\n"
-    "- 美联储：hawkish=偏鹰 · dovish=偏鸽 · pivot=政策转向 · taper=缩表 · cut=降息 · hold=按兵不动\n"
-    "- 通讯社：Reuters=路透 · AP=美联社 · Bloomberg=彭博 · WSJ=华尔街日报 · FT=金融时报 · NYT=纽约时报\n"
-    "- 【叙事】**括号内框架名也必须中文**：例 `[geopolitical war-powers]` → `[地缘·战争权力]`；`[fed-pivot]` → `[联储转向]`；`[RYCC]` → `[油-通胀-美元三重压金]`\n"
-    "- 数字 wire 速记必须翻译并保留原值：`49k`→`4.9 万 (49k)` · `150bp`→`150 个基点 (150bp)` · `517k`→`51.7 万 (517k)`；失业率/GDP/CPI 百分比和 $ 价格不翻\n"
-    "- 法案编号原样保留：`H.Con.Res. 86` 不译；数据缩写 (NFP/CPI/PPI/ISM/UoM) 首次出现需 `非农 (NFP)` 形式带中文翻译\n"
-    "- 句子里不许夹完整英文从句（'still needs Senate approval, and likely faces a veto' → '仍需参议院通过，且预计将遭白宫否决'）\n"
+    "结合本周三 ADP 9.8 万、ISM 制造 53.3、Prices Paid 大降 9.1 点，四份数据一致指向经济放缓。市场把加息推迟到年底，DXY 跌破 100.6 两周低点，10 年美债短端跌得比长端多。这是本周弱数据链条的收尾，属旧叙事内的延续（B 类），不是新方向。\n"
     "\n"
-    "【BREAKING 影响分级标注 v2 · 严苛化】\n"
-    "⭐ 必须严苛！多数 BREAKING 事件应在 ⭐⭐ 档（已 price-in/Trump 重复表态）。\n"
-    "- ⭐⭐⭐⭐⭐ **决定性催化（>$50）**: 实质军事行动 / Fed 主席改向 / 重大数据大幅偏离 / 30Y 破 5.0%\n"
-    "- ⭐⭐⭐⭐ 显著催化 ($25-50): 重大政策转向 / 央行紧急措辞\n"
-    "- ⭐⭐⭐ 中等催化 ($10-25): 重要官员新表态 / 数据符合预期\n"
-    "- ⭐⭐ **常规事件 (<$10·多数应在此档)**: 重复 Trump 表态 / 已 price-in 升级 / OPEC 象征性\n"
-    "- ⭐ 边际/已兑现/脉冲: 第 N 次同类 / 重复新闻\n"
+    "方向利多，判定 ⭐⭐⭐⭐ 显著催化。金价累计 +$110 到 $4,131，不建议追 $4,130 上方，理想入场 $4,110-4,115，目标 $4,160 再看 $4,180。风险：SPDR ETF 仍在流出，说明这波是期货盘不是长线配置；下周三 FOMC 会议纪要和周一 ISM 服务业是关键 test point。\"\n"
     "\n"
-    "【BREAKING 推送门槛 · price-in 折扣】\n"
-    "(1) 是 5min/30min 真新增量？否→减 1-2⭐\n"
-    "(2) 类似事件市场反应过？是→减权\n"
-    "(3) 价格 30min 内有反应？无→不应标 ⭐⭐⭐⭐+\n"
-    "如果折扣后 ⭐数<3 且无新触发条件 → **不发推送**（降噪）\n"
+    "【内部推理工具（用来判断'这事算不算'，但**不写进 push body**）】\n"
     "\n"
-    "【BREAKING 叙事级别二分法 · 取代旧'震荡基调'】\n"
-    "**第一问**：这事件是新叙事还是旧叙事变量？\n"
-    "- **A 新叙事**（创造新因果链/改变定价框架）→ ⭐⭐⭐⭐+ → 旗帜鲜明给方向\n"
-    "  例: Fed 主席改向 / 实质军事行动首次 / 30Y 破 5.0% / Hormuz 实质封锁\n"
-    "- **B 旧叙事变量微调**（已知框架内数据点·多数 BREAKING 属此）→ ⭐⭐ → 延续旧叙事方向（不是震荡）\n"
-    "  例: Trump 又表态 / TACO 第 N 次 / 又一次空袭 / Iran 又一次方案\n"
-    "  处理: 标注'在 [框架名] 内' + 给延续方向（如 RYCC 锁笼 → 偏空延续）\n"
-    "- **C 噪音**（无信息增量）→ 不推送\n"
+    "影响分级（内部推理用，不复读到 body）：\n"
+    "- ⭐⭐⭐⭐⭐ 决定性催化（>$50）：实质军事行动 / Fed 主席改向 / 重大数据大幅偏离 / 30Y 破 5.0%\n"
+    "- ⭐⭐⭐⭐ 显著催化（$25-50）：重大政策转向 / 央行紧急措辞\n"
+    "- ⭐⭐⭐ 中等催化（$10-25）：重要官员新表态 / 数据符合预期\n"
+    "- ⭐⭐ 常规事件（<$10，多数应在此档）：重复 Trump 表态 / 已 price-in 升级 / OPEC 象征性\n"
+    "- ⭐ 边际/已兑现/脉冲：第 N 次同类 / 重复新闻\n"
     "\n"
-    "**关键**：B 类事件**给方向不写震荡**——例如 Iran 又强硬属 RYCC 框架内 → 旧空头方向延续 + ⭐⭐\n"
-    "**禁止**：用'方向不清/双向夹压/震荡'掩饰对叙事级别的判断不足\n"
-    "**真震荡只在**：多新叙事方向冲突 OR 系统真无信号\n"
+    "price-in 折扣：\n"
+    "(1) 是 5min/30min 真新增量？否 → 减 1-2⭐\n"
+    "(2) 类似事件市场反应过？是 → 减权\n"
+    "(3) 价格 30min 内有反应？无 → 不应标 ⭐⭐⭐⭐+\n"
+    "折扣后 ⭐<3 且无新触发条件 → **不发推送**\n"
     "\n"
-    "【BREAKING 因果链必备链路】（必须命中至少一条 2-3 步传导）:\n"
-    "- 油价 → 通胀预期 → 真实利率 → 持金成本\n"
-    "- 谈判/地缘 → 避险买盘 → 金价直接\n"
-    "- 美联储讲话/数据 → 利率预期 → DXY/真实利率 → 金价\n"
-    "- 央行购金/ETF流 → 物理供需 → 金价\n"
+    "叙事级别（推理时判断，body 里用自然语言点明，不用 A/B/C 代号露出）：\n"
+    "- A 新叙事（改变定价框架）→ ⭐⭐⭐⭐+ → 旗帜鲜明给方向\n"
+    "- B 旧叙事变量（多数属此）→ ⭐⭐ → 延续旧方向，禁写\"震荡\"掩饰\n"
+    "- C 噪音 → 不推送\n"
     "\n"
-    "【BREAKING 人话替换表】（同 DAILY，push 必翻译）\n"
-    "- 'real yield压缩' → '实际利率下降'\n"
-    "- 'COT positioning unwind' → '期货大户多头爆满见顶信号'\n"
-    "- 'regime切换' → '大环境压制金价'\n"
-    "- 'breakeven锁笼' → '油价撑高通胀预期'\n"
-    "- 'RYCC锁笼' → '油价高+谈判破裂+美元强=三重压金'\n"
+    "常用翻译（推理时避免行话，进 body 时直接用人话）：\n"
+    "- Reuters=路透 · Bloomberg=彭博 · AP=美联社 · WSJ=华尔街日报 · FT=金融时报\n"
+    "- hawkish=偏鹰 · dovish=偏鸽 · pivot=政策转向 · cut=降息 · hold=按兵不动\n"
+    "- Congress=美国国会 · House=众议院 · Senate=参议院 · Fed=美联储 · ECB=欧央行\n"
+    "- 数据缩写（NFP/CPI/ISM/PMI）首次出现带中文注释，如'非农就业（NFP）'\n"
+    "- 数字 wire 速记翻译并保留原值：`49k`→`4.9 万（49k）`；失业率/GDP/CPI 百分比和 $ 价格不翻\n"
     "\n"
-    "【BREAKING 推送前自检】（全 Yes 才推；任何 No 重写或不推）:\n"
+    "【推送前自检】（全 Yes 才推；任何 No 重写或不推）:\n"
     "(1) 量级 ≥$15 或改变叙事？（否=不推）\n"
-    "(2) 第一行是 🚨[突发·⭐X 方向↑↓] 结论吗？\n"
-    "(3) 事件行有 ⭐数 + 因果链 2 步 + 量化幅度 + 持续性吗？\n"
-    "(4) 还有投行术语没翻译吗？\n"
-    "(5) 有没有捏造支撑/阻力/进场价？（违规=重写）\n"
+    "(2) body 是 3 段自然文本？（不是 block 模板）\n"
+    "(3) body 里有没有 【事件】/【信号】/【叙事】/【交易】/【后续】/【哑区】 block 标题？（有=重写）\n"
+    "(4) body 里有没有\"我的判断：\"/\"我看不同：\"/\"关键剧本：\" 段首模板？（有=重写）\n"
+    "(5) 数字都带 $/%/bp 单位？$ 有没有被吞掉？（'$4131'不是',131'）\n"
+    "(6) body 里有没有 score=/conv=/USD=/fed=/geo= 参数标签？（有=重写）\n"
+    "(7) ⭐ 评级有在正文里自然嵌入吗？（下游 push 分类必需）\n"
+    "(8) 有没有捏造支撑/阻力/进场价？（违规=重写）\n"
     "\n"
-    f"   发推送命令：python {NTFY_SCRIPT} \"🚨 [突发] 简短标题\" \"v3 BREAKING 正文\"\n"
+    f"   发推送命令(**必须用单引号 '...' 包 title 和 body**,防止 bash 把 $4,131 展开成 ,131):\n"
+    f"   python {NTFY_SCRIPT} '🚨 [突发] 一句话结论' '研究员简报 3 段正文'\n"
+    "   若 body 里有单引号(比如中文引号'…'），改用双引号+反斜杠转义 $: \"…\\$4,131…\"\n"
     "\n"
     "**关键**：分析完毕在 cycle log 里写一句结论\"是否推送\"+\"理由\"；不推送的不算失败，是降噪。\n"
 )
@@ -347,7 +342,7 @@ WEEKEND_SUMMARY_PROMPT = (
     "   - 亚洲/中东市场早盘情绪\n"
     "   - 原油、美元周末走势\n"
     f"4. 更新 {MACRO_PATH_STR}，在【一行结论】顶部加【开盘预警】标注\n"
-    f"5. 发 ntfy 推送：python {NTFY_SCRIPT} \"🌅 [开盘预警] 周末汇总\" \"摘要\"\n"
+    f"5. 发 ntfy 推送(单引号防 $ 被吞):python {NTFY_SCRIPT} '🌅 [开盘预警] 周末汇总' '摘要'\n"
     "   推送格式：\n"
     "   今晚22:00开盘 | 方向: 多/空/中性\n"
     "   ▲/▼ 周末最重要事件1\n"
@@ -381,7 +376,9 @@ DAILY_FORECAST_PROMPT = (
     "5. 产出 **≥1 个独创框架**（不借用第三方）+ **反事实**（看多/看空各一段）\n"
     f"6. 覆盖写 {FORECAST_PATH_STR}（≤ 150 行；超出删旧留新——研究员产物也要 Trader 能读完）\n"
     f"7. 若推演结论有实质变化，同步更新 {MACRO_PATH_STR} 的【一行结论】和【关键倒计时】\n"
-    f"8. 发推送（🔬前缀 · 第一人称交易员叙事 · 4 段, 200-300 字）：python {NTFY_SCRIPT} \"🔬[每日推演] emoji+一句结论\" \"4段叙事正文\"\n"
+    f"8. 发推送(🔬前缀 · 研究员简报 · 3 段, 200-350 字)\n"
+    f"   **必须用单引号包 args**(防 bash 把 $4,131 展开成 ,131):\n"
+    f"   python {NTFY_SCRIPT} '🔬[每日推演] emoji+一句结论' '3 段自然叙述正文'\n"
     "\n"
     "【推送格式 v6 · 第一人称交易员叙事 (用户 2026-05-08 反馈: 喜欢这种)】\n"
     "不要分章节硬模板, 不要 [时间窗·叙事级别·方向] tag, 不要表格, 不要 ▲▼ bullet emoji.\n"
@@ -391,36 +388,31 @@ DAILY_FORECAST_PROMPT = (
     "  例: ⚖️ 关税裁定已被定价，非农13小时后才是真炸弹\n"
     "      🎯 $100 涨幅是原油的功劳，谅解备忘录溢价还没进场\n"
     "\n"
-    "第一段「我的判断」(2-3 句): 今天涨/跌的本质是什么, 用价格行为佐证.\n"
-    "  例: '关税法院裁决和油价反弹今天已经被市场提前消化了, 1小时 +$9 把新闻吃完,\n"
-    "       价格在 $4,698 附近今日被三次磁吸都没突破, 当前距高点只剩 $0.65.'\n"
+    "**3 段自然叙述**（段之间空一行；段内直接叙述，禁用「」小标题、禁用段首模板短句）：\n"
     "\n"
-    "第二段「我看不同」(2-3 句): 给一个 contrarian view + 关键论据.\n"
-    "  例: '市场大家会说双向均衡, 我看不同: 伊斯兰革命卫队在谈判窗口内主动打美国海军,\n"
-    "       这是强硬派刻意破局的信号, 谅解备忘录成功概率已经压到三成以下.'\n"
+    "第 1 段（80-120 字）今天在发生什么 + 价格行为佐证：\n"
+    "  开头直接讲这一天/这一时段的本质（涨/跌/横的原因），带今日 ±$XX 变化，用价格行为佐证。**不要以\"我的判断：\"开头**。\n"
+    "  例: \"关税法院裁决和油价反弹今天已经被市场提前消化，1 小时 +$9 把新闻吃完，价格在 $4,698 附近今日被三次磁吸都没突破，当前距高点只剩 $0.65。\"\n"
     "\n"
-    "第三段「两/三个关键剧本」: 列举式, 每个带概率 + 触发条件 + 价位.\n"
-    "  例: '两个关键剧本:\n"
-    "       一, 非农弱(低于4.9万)+谅解备忘录破局(三成概率), 金价直上 $4,750-4,780;\n"
-    "       二, 非农强(高于8万)+谅解备忘录签署(两成概率), 双重利空, 跌破 $4,660.'\n"
+    "第 2 段（100-150 字）差异化观点 + 关键论据 + 剧本：\n"
+    "  给一个市场共识之外的看法，带 1-2 条硬论据，然后自然引出 2-3 个剧本（不用\"一、二、三\"枚举，用\"一个偏空场景是……另一种情况是……\"这种自然叙述）。**不要以\"我看不同：\"开头**。\n"
+    "  例: \"市场大家在讲双向均衡，但伊斯兰革命卫队在谈判窗口内主动打美国海军，是强硬派刻意破局的信号，谅解备忘录成功概率已经压到三成以下。一个偏空场景是非农强+备忘录签署（两成），双重利空跌破 $4,660；一个偏多场景是非农弱+备忘录破局（三成），金价直上 $4,750-4,780。\"\n"
     "\n"
-    "第四段「现在动作」: 无仓 / 有多 / 有空 三档具体动作 + 触发价.\n"
-    "  例: '现在无仓就别动, 等非农后弱数据站稳 $4,720 再买, 强数据破 $4,678 再空.\n"
-    "       有多仓先减半, 止损上移 $4,682.'\n"
+    "第 3 段（80-120 字）现在动作 + 关键位 + 哑区：\n"
+    "  给无仓/有多/有空三档动作，带触发价位。末尾自然接一句哑区（如有）。**不要以\"现在动作：\"开头**。\n"
+    "  例: \"现在无仓就别动，等非农后弱数据站稳 $4,720 再买，强数据破 $4,678 再空；有多仓先减半，止损上移 $4,682。⚠️ 12:00 UTC 起绝对禁入场。\"\n"
     "\n"
-    "末尾 ⚠️ 哑区警告 (如有): 一行.\n"
-    "  例: '⚠️ 12:00 UTC 起绝对禁入场.'\n"
-    "\n"
-    "【7:41 风格硬规】\n"
-    "1. 第一人称 '我的判断/我看不同', 不写 '建议/推测/可能'\n"
-    "2. 价格写 $4,698 形式, 概率写 '三成/七成' 不写 30%/70%\n"
-    "3. 不要 ⭐ 评级行 (评级在 macro.md 内部用, push 不复读)\n"
-    "4. 不要术语 (actual vs consensus σ / ATR(7) / regime / breakeven 锁笼)\n"
-    "   术语必须翻译: 'σ surprise' → '远超市场预期'; 'ATR(7) $40' → '比平均日波动 $40 大'\n"
-    "5. 不要 [SPIKE/INTRADAY/SWING] tag (隐含在第四段的'触发价位'里)\n"
-    "6. 不要表格 (单行/markdown |---|---|), 不要 ▲▼ bullet emoji\n"
-    "7. 200-300 字, 上限 400 字; 信息密度 > 长度\n"
-    "8. 第一段必须有'今日 ±$XX' (用 daemon 前置 today_change_dollar, 不从新闻文字摘)\n"
+    "【硬规则】（违反=重写）\n"
+    "1. **禁段首模板套话**：不写\"我的判断：\"、\"我看不同：\"、\"两个关键剧本：\"、\"现在动作：\" 这类冒号标签；观点直接说，别加标签框。\n"
+    "2. **禁「」小标题**：3 段之间只用空行分隔，不用「我的判断」「我看不同」这种小标题包起来。\n"
+    "3. 价格写 $4,698 / $4,131 形式（带 $ 和逗号），概率用'三成/七成'不写 30%/70%。**禁 $ 被吞成 ',698'**。\n"
+    "4. **禁术语堆砌**：\"叙事\" / \"变盘点\" / \"锁笼\" / \"regime\" / \"breakeven\" / \"actual vs consensus σ\" / \"ATR(7)\" 全部换人话。\n"
+    "5. 不写 ⭐ 评级独立行（评级在 macro.md 内部用；如果一定要标级，嵌入正文一处，如\"整体判定 ⭐⭐⭐ 中等催化\"）。\n"
+    "6. **禁参数标签**：body 里绝不出现 score=+X.X / conv=X / USD=up / fed=dovish_lean / geo=calm / zones=X（这些是内部状态标签，不进 push）。\n"
+    "7. **禁分区表格**：\"3960-4120 加仓 ×1.80\" 这种给 EA 看的分区数据，进 macro.md，**不进 push body**。\n"
+    "8. 不要 [SPIKE/INTRADAY/SWING] tag。不要表格、不要 ▲▼ bullet emoji。\n"
+    "9. 200-350 字，上限 400 字；信息密度 > 长度。\n"
+    "10. 第一段必须有'今日 ±$XX'（用 daemon 前置 today_change_dollar，不从新闻文字摘）。\n"
     "\n"
     "【内部分析方法 (用于推理, 不写进 push body)】\n"
     "下面 影响分级/已 price-in 折扣/多空打分/叙事级别二分法/因果链/人话替换表/推送前自检\n"
@@ -686,7 +678,7 @@ def fetch_price_preamble() -> str:
             [PYTHON_FOR_MT5, str(GET_PRICE_SCRIPT), "--full"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=PRICE_FETCH_TIMEOUT,
-            env={**os.environ, "MT5_BACKEND": "http", "MT5LINUX_PORT": "8101"},
+            env={**os.environ, "MT5_BACKEND": "http", "MT5LINUX_HOST": "10.66.66.14", "MT5LINUX_PORT": "11001"},
         )
         stdout_txt = (result.stdout or b"").decode("utf-8", errors="replace").strip()
         stderr_txt = (result.stderr or b"").decode("utf-8", errors="replace").strip()
@@ -1366,16 +1358,17 @@ def main():
             trigger = read_and_clear_trigger()
             if trigger:
                 log(f"⚡ 突发触发：{trigger.get('headline','')[:60]}")
-                # 突发用 sonnet，但不计入 session_cycle_count（突发不影响重建节奏）
+                # 突发用一次性 ephemeral session：突发 prompt 自带 re-read macro.md，
+                # 不需前轮记忆；独立 session 避免每次突发向主 session 堆上下文导致溢出
+                _brk_sid = str(uuid.uuid4())
                 state = _run_cycle(
                     build_breaking_prompt(trigger), "breaking",
-                    session_id, is_first, cycle_count,
+                    _brk_sid, True, cycle_count,
                     consecutive_failures, last_success, last_session_rebuild,
                     last_heartbeat, last_regular_cycle, is_breaking=True,
                     model=CLAUDE_MODEL_BREAKING,
                 )
-                # 更新状态
-                is_first = state["is_first"]
+                # 不更新 is_first / session_id，保持主 session 干净
                 cycle_count = state["cycle_count"]
                 consecutive_failures = state["consecutive_failures"]
                 last_success = state["last_success"]
@@ -1401,15 +1394,17 @@ def main():
             if should_send_daily_forecast():
                 _slot = current_forecast_slot()
                 log(f"触发黄金研究员推演（slot {_slot:02d}:10 UTC / Opus）")
+                # 推演同样用 ephemeral session，避免 6 次/天的推演污染主 session
+                _fc_sid = str(uuid.uuid4())
                 state = _run_cycle(
                     DAILY_FORECAST_PROMPT, "daily_forecast",
-                    session_id, is_first, cycle_count,
+                    _fc_sid, True, cycle_count,
                     consecutive_failures, last_success, last_session_rebuild,
                     last_heartbeat, last_regular_cycle,
                     model=CLAUDE_MODEL_FORECAST,
                 )
                 mark_daily_forecast_sent()
-                is_first = state["is_first"]
+                # 不更新 is_first / session_id
                 cycle_count = state["cycle_count"]
                 consecutive_failures = state["consecutive_failures"]
                 last_success = state["last_success"]
@@ -1421,15 +1416,17 @@ def main():
             # ── 优先级3：周日 16:00 UTC 开盘前周末汇总────────────────────
             if should_send_weekend_summary():
                 log("触发周末汇总（周日16:00 UTC）")
+                # 周末汇总同样用 ephemeral session
+                _wk_sid = str(uuid.uuid4())
                 state = _run_cycle(
                     WEEKEND_SUMMARY_PROMPT, "weekend",
-                    session_id, is_first, cycle_count,
+                    _wk_sid, True, cycle_count,
                     consecutive_failures, last_success, last_session_rebuild,
                     last_heartbeat, last_regular_cycle,
                     model=CLAUDE_MODEL_WEEKEND,
                 )
                 mark_weekend_summary_sent()
-                is_first = state["is_first"]
+                # 不更新 is_first / session_id
                 cycle_count = state["cycle_count"]
                 consecutive_failures = state["consecutive_failures"]
                 last_success = state["last_success"]
