@@ -12,3 +12,24 @@ venv/
 .env
 .env.*
 .ntfy_token
+# --- 凭证兜底 credential safety net (2026-08-02) ---
+.mt5_creds*
+.ntfy_token
+.ntfy_listener_secret
+.idle_webhook_token
+.smtp_creds
+.futu_env
+.futu_trade_creds
+.env
+.env.*
+*_secret
+*_token
+*_creds
+*.pem
+*.key
+secrets/
+# 保留模板/示例文件可提交
+!*.example
+!*.sample
+!*.template
+!*.env.example
